@@ -1,0 +1,19 @@
+services:
+  rainmatrix:
+    build: .
+    container_name: rainmatrix_web
+    restart: unless-stopped
+    environment:
+      - RAIN_CACHE_DB=/data/rain_cache.sqlite3
+    volumes:
+      # Persist the SQLite cache
+      - rainmatrix_data:/data
+
+      # Ensure places.txt is editable without rebuild (recommended)
+      - ./places.txt:/app/places.txt:ro
+    ports:
+      # local-only bind; Nginx will proxy to this
+      - "127.0.0.1:8005:8000"
+
+volumes:
+  rainmatrix_data:
