@@ -1,0 +1,67 @@
+{
+  "default_list": "default",
+  "lists": [
+    {
+      "id": "default",
+      "name": "Default",
+      "places": [
+        {
+          "label": "PGAL",
+          "lat": 13.507,
+          "lon": 120.906
+        },
+        {
+          "label": "BACO",
+          "lat": 13.358,
+          "lon": 121.098
+        },
+        {
+          "label": "CAL",
+          "lat": 13.416,
+          "lon": 121.161
+        },
+        {
+          "label": "BARCE",
+          "lat": 13.274,
+          "lon": 121.239
+        },
+        {
+          "label": "VIC",
+          "lat": 13.174,
+          "lon": 121.278
+        },
+        {
+          "label": "PIN",
+          "lat": 13.035,
+          "lon": 121.489
+        },
+        {
+          "label": "RXM",
+          "lat": 12.591,
+          "lon": 121.518
+        },
+        {
+          "label": "SJ1",
+          "lat": 12.352,
+          "lon": 121.063
+        },
+        {
+          "label": "SAB",
+          "lat": 12.842,
+          "lon": 120.776
+        }
+      ]
+    },
+    {
+      "id": "list_1776333651792",
+      "name": "My New List",
+      "places": [
+        {
+          "label": "Manila",
+          "lat": 14.5995,
+          "lon": 120.9842
+        }
+      ]
+    }
+  ]
+}
