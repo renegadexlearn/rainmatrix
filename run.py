@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import json
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -40,7 +41,7 @@ except Exception:
 DEFAULT_TZ = "Asia/Manila"
 DEFAULT_COUNTRY = "PH"
 DEFAULT_MODEL = "ecmwf_ifs"
-DEFAULT_PLACES_FILE = "places.txt"
+DEFAULT_PLACES_FILE = "places.json"
 
 DAY_START_HOUR = 6
 DAY_END_HOUR = 18
@@ -211,43 +212,46 @@ def place_label_from_query(q: str) -> str:
     return q.split(",")[0].strip()
 
 
-def read_places_file(path: str) -> List[Place]:
+def read_places_file(path: str, list_id: Optional[str] = None) -> Tuple[List[Place], List[Dict[str, str]], str]:
     if not os.path.exists(path):
         raise FileNotFoundError(path)
 
-    places: List[Place] = []
-
     with open(path, encoding="utf-8") as f:
-        for lineno, line in enumerate(f, 1):
-            s = line.strip()
-            if not s or s.startswith("#"):
-                continue
+        data = json.load(f)
 
-            parts = [p.strip() for p in s.split(",")]
-            if len(parts) != 3:
-                raise ValueError(
-                    f"Invalid format in {path} line {lineno}. "
-                    f"Expected: Label, lat, lon"
-                )
+    default_list_id = data.get("default_list", "")
+    lists_data = data.get("lists", [])
 
-            label, lat, lon = parts
+    if not lists_data:
+        raise ValueError(f"No lists found in {path}.")
 
-            places.append(
-                Place(
-                    label=label,
-                    query=label,
-                    lat=float(lat),
-                    lon=float(lon),
-                )
+    if list_id is None:
+        list_id = default_list_id
+
+    selected_list = next((lst for lst in lists_data if lst["id"] == list_id), None)
+    if selected_list is None:
+        selected_list = lists_data[0]
+        list_id = selected_list["id"]
+
+    places: List[Place] = []
+    for p in selected_list.get("places", []):
+        places.append(
+            Place(
+                label=p["label"],
+                query=p["label"],
+                lat=float(p["lat"]),
+                lon=float(p["lon"]),
             )
+        )
 
-    return places
+    lists_info = [{"id": lst["id"], "name": lst["name"]} for lst in lists_data]
+
+    return places, lists_info, list_id
 
 
-
-def places_signature(path: str) -> str:
+def places_signature(path: str, list_id: str) -> str:
     st = os.stat(path)
-    return f"{int(st.st_mtime)}:{st.st_size}"
+    return f"{int(st.st_mtime)}:{st.st_size}:{list_id}"
 
 
 def safe_now_date_in_tz(tz_name: str) -> date:
@@ -432,6 +436,8 @@ def render_html(
         tz: str,
         model: str,
         places: List[Place],
+        lists_info: List[Dict[str, str]],
+        active_list_id: str,
         time_index: List[datetime],
         cell_map: Dict[str, Dict[str, Tuple[str, float, int]]],  # icon, precip_mm, pop_pct
         from_cache: bool,
@@ -461,6 +467,18 @@ def render_html(
         label = d.strftime("%a %b %d")
         date_buttons.append(f"<a class='dchip {active}' href='{href}'>{label}</a>")
         d += timedelta(days=1)
+
+    list_buttons = []
+    for l_info in lists_info:
+        active = "active" if l_info["id"] == active_list_id else ""
+
+        # Build URL for switching list but maintaining date
+        l_params = dict(base_params)
+        l_params["list"] = l_info["id"]
+        # keep the same target_date
+        l_href = build_url(l_params, target_date)
+
+        list_buttons.append(f"<a class='dchip {active}' href='{l_href}'>{l_info['name']}</a>")
 
     forecast_label = target_date.strftime("%d-%b-%y").upper()
 
@@ -751,6 +769,12 @@ th:not(.timehead), td:not(.time) {{
 
 <div class="navbar">
   <div class="dchips">
+    {''.join(list_buttons)}
+  </div>
+</div>
+
+<div class="navbar">
+  <div class="dchips">
     {''.join(date_buttons)}
   </div>
 
@@ -870,6 +894,7 @@ def index():
     tz = request.args.get("tz", DEFAULT_TZ)
     country = request.args.get("country", DEFAULT_COUNTRY)  # kept for URL/cache compatibility
     model = request.args.get("model", DEFAULT_MODEL)
+    list_id = request.args.get("list")
 
     # Cache bypass
     nocache = request.args.get("nocache") == "1"
@@ -901,13 +926,12 @@ def index():
 
     # Places file (NEW: coordinates-based)
     try:
-        places = read_places_file(DEFAULT_PLACES_FILE)  # returns List[Place]
-        p_sig = places_signature(DEFAULT_PLACES_FILE)
+        places, lists_info, active_list_id = read_places_file(DEFAULT_PLACES_FILE, list_id)
+        p_sig = places_signature(DEFAULT_PLACES_FILE, active_list_id)
     except FileNotFoundError:
         return Response(
             f"Missing places file: {DEFAULT_PLACES_FILE}\n"
-            "Create it with lines like:\n"
-            "AIVR, 13.174, 121.278\n",
+            "Create it as a valid JSON.\n",
             status=500,
             mimetype="text/plain",
         )
@@ -926,6 +950,7 @@ def index():
         "tz": tz,
         "country": country,
         "model": model,
+        "list": active_list_id
     }
     if nocache:
         base_params["nocache"] = "1"
@@ -979,6 +1004,8 @@ def index():
         tz=tz,
         model=model,
         places=places,
+        lists_info=lists_info,
+        active_list_id=active_list_id,
         time_index=time_index,
         cell_map=cell_map,
         from_cache=False,
@@ -999,6 +1026,211 @@ def index():
         )
 
     return Response(html, mimetype="text/html")
+
+
+@app.get("/admin")
+def admin_page():
+    # Simple HTML page with Vue.js to manage places
+    html = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Mindoro Rain Forecast - Admin</title>
+<script src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.js"></script>
+<style>
+body { font-family: Segoe UI, Arial, sans-serif; margin:16px; background:#f5f5f5;}
+.container { max-width: 800px; margin: auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+h1, h2, h3 { margin-top: 0; }
+.form-group { margin-bottom: 10px; }
+input { padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
+button { padding: 8px 12px; border: none; background: #111; color: white; border-radius: 4px; cursor: pointer; }
+button:hover { background: #333; }
+button.danger { background: #dc3545; }
+button.danger:hover { background: #c82333; }
+.list-item, .place-item { border: 1px solid #ddd; padding: 10px; margin-bottom: 10px; border-radius: 4px; background: #fafafa; display: flex; align-items: center; gap: 10px;}
+.place-item input { flex: 1; }
+.actions { margin-left: auto; display: flex; gap: 5px; }
+.dragger { cursor: grab; padding: 0 10px; color: #888; }
+.section { margin-bottom: 30px; border-bottom: 1px solid #eee; padding-bottom: 20px;}
+.section:last-child { border-bottom: none; }
+</style>
+</head>
+<body>
+<div id="app" class="container">
+  <h1>Admin Page</h1>
+  <div v-if="loading">Loading...</div>
+  <div v-else>
+    <div class="section">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 15px;">
+        <h2 style="margin:0;">Lists</h2>
+        <button @click="addList">Add List</button>
+      </div>
+      <div class="form-group">
+        <label>Default List ID:</label>
+        <select v-model="config.default_list" style="padding: 8px;">
+            <option v-for="l in config.lists" :value="l.id">{{ l.name }} ({{ l.id }})</option>
+        </select>
+      </div>
+      <div style="display:flex; gap: 10px; flex-wrap:wrap;">
+         <div v-for="(l, index) in config.lists" :key="l.id" style="border: 1px solid #ccc; padding: 10px; border-radius: 5px; cursor:pointer;" :style="{background: activeListId === l.id ? '#e0f7fa' : '#fff'}" @click="activeListId = l.id">
+            <div style="font-weight:bold;">{{ l.name }}</div>
+            <div style="font-size: 12px; color: #666;">ID: {{ l.id }}</div>
+            <button class="danger" style="padding: 4px 8px; font-size: 12px; margin-top:5px;" @click.stop="removeList(index)">Delete</button>
+         </div>
+      </div>
+    </div>
+
+    <div class="section" v-if="activeList">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 15px;">
+          <h2 style="margin:0;">Edit List: <input v-model="activeList.name" placeholder="List Name" /></h2>
+      </div>
+      <div class="form-group">
+        <label style="font-size: 12px; color: #666;">List ID (must be unique):</label>
+        <input v-model="activeList.id" placeholder="List ID" style="display:block; margin-top:4px;" />
+      </div>
+
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 10px;">
+          <h3 style="margin:0;">Places</h3>
+          <button @click="addPlace">Add Place</button>
+      </div>
+
+      <div v-for="(place, index) in activeList.places" :key="index" class="place-item">
+         <span class="dragger" @click="movePlaceUp(index)" title="Move Up">▲</span>
+         <span class="dragger" @click="movePlaceDown(index)" title="Move Down">▼</span>
+         <input v-model="place.label" placeholder="Label" style="max-width: 100px;" />
+         <input v-model="place.lat" type="number" step="0.000001" placeholder="Latitude" />
+         <input v-model="place.lon" type="number" step="0.000001" placeholder="Longitude" />
+         <button class="danger" @click="removePlace(index)">X</button>
+      </div>
+    </div>
+
+    <div style="text-align: right; margin-top: 20px;">
+       <button @click="saveConfig" style="font-size: 16px; padding: 10px 20px;">Save Configuration</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const { createApp } = Vue;
+
+createApp({
+  data() {
+    return {
+      loading: true,
+      config: { default_list: "", lists: [] },
+      activeListId: null
+    };
+  },
+  computed: {
+    activeList() {
+      if (!this.config.lists) return null;
+      return this.config.lists.find(l => l.id === this.activeListId);
+    }
+  },
+  mounted() {
+    this.fetchConfig();
+  },
+  methods: {
+    fetchConfig() {
+      fetch('/api/places')
+        .then(res => res.json())
+        .then(data => {
+          this.config = data;
+          if (this.config.lists && this.config.lists.length > 0) {
+              if(!this.activeListId || !this.config.lists.find(l=>l.id === this.activeListId)){
+                  this.activeListId = this.config.lists[0].id;
+              }
+          }
+          this.loading = false;
+        });
+    },
+    saveConfig() {
+      fetch('/api/places', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(this.config)
+      })
+      .then(res => {
+         if (res.ok) {
+             alert('Saved successfully!');
+             this.fetchConfig();
+         } else {
+             alert('Error saving configuration.');
+         }
+      });
+    },
+    addList() {
+      const newId = 'list_' + Date.now();
+      this.config.lists.push({
+        id: newId,
+        name: 'New List',
+        places: []
+      });
+      this.activeListId = newId;
+    },
+    removeList(index) {
+      if (confirm('Are you sure you want to delete this list?')) {
+        this.config.lists.splice(index, 1);
+        if (this.config.lists.length > 0) {
+            this.activeListId = this.config.lists[0].id;
+        } else {
+            this.activeListId = null;
+        }
+      }
+    },
+    addPlace() {
+      if (this.activeList) {
+        this.activeList.places.push({ label: '', lat: 0, lon: 0 });
+      }
+    },
+    removePlace(index) {
+      if (this.activeList) {
+        this.activeList.places.splice(index, 1);
+      }
+    },
+    movePlaceUp(index) {
+        if (index > 0 && this.activeList) {
+            const temp = this.activeList.places[index - 1];
+            this.activeList.places[index - 1] = this.activeList.places[index];
+            this.activeList.places[index] = temp;
+        }
+    },
+    movePlaceDown(index) {
+        if (this.activeList && index < this.activeList.places.length - 1) {
+            const temp = this.activeList.places[index + 1];
+            this.activeList.places[index + 1] = this.activeList.places[index];
+            this.activeList.places[index] = temp;
+        }
+    }
+  }
+}).mount('#app');
+</script>
+</body>
+</html>"""
+    return Response(html, mimetype="text/html")
+
+
+@app.get("/api/places")
+def api_get_places():
+    if not os.path.exists(DEFAULT_PLACES_FILE):
+        return {}
+    with open(DEFAULT_PLACES_FILE, encoding="utf-8") as f:
+        data = json.load(f)
+    return data
+
+
+@app.post("/api/places")
+def api_post_places():
+    data = request.json
+    if not data:
+        return Response("Invalid JSON", status=400)
+
+    # Save to file
+    with open(DEFAULT_PLACES_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":
