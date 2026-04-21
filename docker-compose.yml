@@ -9,8 +9,8 @@ services:
       # Persist the SQLite cache
       - rainmatrix_data:/data
 
-      # Ensure places.txt is editable without rebuild (recommended)
-      - ./places.txt:/app/places.txt:ro
+      # Ensure places.json is editable without rebuild (recommended)
+      - ./places.json:/app/places.json
     ports:
       # local-only bind; Nginx will proxy to this
       - "127.0.0.1:8005:8000"

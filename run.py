@@ -2,7 +2,7 @@
 """
 Mindoro Rain Matrix — Flask Web App (with SQLite cache)
 
-- Loads places from places.txt
+- Loads places from places.json
 - Visit:
     http://127.0.0.1:5000/                 -> shows today's matrix (Asia/Manila)
     http://127.0.0.1:5000/?date=2025-12-31 -> shows that day's matrix
