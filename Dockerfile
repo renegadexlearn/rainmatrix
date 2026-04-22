@@ -11,9 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY run.py /app/run.py
 
-# If you commit places.txt in git, keep this line.
+# If you commit places.json in git, keep this line.
 # If you prefer to keep it outside git, we'll mount it via docker-compose.
-COPY places.txt /app/places.txt
+COPY places.json /app/places.json
 
 RUN pip install --no-cache-dir --upgrade pip \
  && pip install --no-cache-dir flask requests gunicorn
