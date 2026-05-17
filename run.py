@@ -53,6 +53,7 @@ LIGHT_MAX = 2.5
 MODERATE_MAX = 7.5
 
 SCALE_MAX_MM = 7.0
+SOLAR_SCALE_MAX_WM2 = 1000.0
 
 SKYBLUE = "#87CEEB"
 VIOLET = "#8A2BE2"
@@ -174,6 +175,20 @@ def precip_bg_color(p_mm: float) -> str:
     )
 
 
+def solar_bg_color(watts_m2: float) -> str:
+    w = max(0.0, _to_float(watts_m2))
+    t = min(w / SOLAR_SCALE_MAX_WM2, 1.0)
+
+    if t <= 0.5:
+        return _lerp_color("#F1F5F9", "#FDE68A", t / 0.5)
+    return _lerp_color("#FDE68A", "#F59E0B", (t - 0.5) / 0.5)
+
+
+def solar_display(watts_m2: float) -> str:
+    w = _to_float(watts_m2)
+    return "-" if w <= 0 else f"{round(w):.0f}"
+
+
 def time_bg_color(dt: datetime) -> str:
     """
     Smooth day/night gradient for Time column using your palette.
@@ -272,6 +287,10 @@ def build_url(base_params: Dict[str, str], new_date: Optional[date]) -> str:
         params["date"] = new_date.isoformat()
     return "/?" + urlencode(params)
 
+
+def normalized_view(view: Optional[str]) -> str:
+    return "solar" if view == "solar" else "rain"
+
 # ---------------- CLIENT ----------------
 
 class OpenMeteoClient:
@@ -314,7 +333,7 @@ class OpenMeteoClient:
         params = {
             "latitude": lat,
             "longitude": lon,
-            "hourly": "precipitation,precipitation_probability,cloudcover",
+            "hourly": "precipitation,precipitation_probability,cloudcover,shortwave_radiation",
             "timezone": tz,
             "forecast_days": 7,
             "models": model,
@@ -331,6 +350,7 @@ class OpenMeteoClient:
             "precip": h["precipitation"],
             "pop": h.get("precipitation_probability") or [0] * len(h["time"]),
             "cloud": h["cloudcover"],
+            "solar": h.get("shortwave_radiation") or [0] * len(h["time"]),
         }
 
 
@@ -439,10 +459,11 @@ def render_html(
         lists_info: List[Dict[str, str]],
         active_list_id: str,
         time_index: List[datetime],
-        cell_map: Dict[str, Dict[str, Tuple[str, float, int]]],  # icon, precip_mm, pop_pct
+        cell_map: Dict[str, Dict[str, Tuple[str, float, int, float]]],  # icon, precip_mm, pop_pct, solar_wm2
         from_cache: bool,
         nocache: bool,
         base_params: Dict[str, str],
+        view: str,
     ) -> str:
     """
     Updated pill/badge colors (POP):
@@ -452,7 +473,10 @@ def render_html(
       - > 80%     -> red
     """
 
-    title = "Mindoro Rain Forecast"
+    is_solar_view = view == "solar"
+    title = "Mindoro Solar Forecast" if is_solar_view else "Mindoro Rain Forecast"
+    table_id = "solarTable" if is_solar_view else "rainTable"
+    download_prefix = "solar-matrix" if is_solar_view else "rain-matrix"
 
     prev_date = target_date - timedelta(days=1)
     next_date = target_date + timedelta(days=1)
@@ -479,6 +503,17 @@ def render_html(
         l_href = build_url(l_params, target_date)
 
         list_buttons.append(f"<a class='dchip {active}' href='{l_href}'>{l_info['name']}</a>")
+
+    view_buttons = []
+    for view_id, label in [("rain", "Rain"), ("solar", "Solar")]:
+        active = "active" if view_id == view else ""
+        v_params = dict(base_params)
+        if view_id == "solar":
+            v_params["view"] = "solar"
+        else:
+            v_params.pop("view", None)
+        v_href = build_url(v_params, target_date)
+        view_buttons.append(f"<a class='dchip {active}' href='{v_href}'>{label}</a>")
 
     forecast_label = target_date.strftime("%d-%b-%y").upper()
 
@@ -532,6 +567,59 @@ def render_html(
         </span>asahang uulan
       </div>
     """
+
+    solar_samples = [
+        (0.0, "0 W/m² - no usable sun"),
+        (250.0, "250 W/m² - weak sun"),
+        (500.0, "500 W/m² - moderate sun"),
+        (750.0, "750 W/m² - strong sun"),
+        (SOLAR_SCALE_MAX_WM2, f"{SOLAR_SCALE_MAX_WM2:.0f} W/m² - excellent sun"),
+    ]
+    solar_legend_items = "".join(
+        f"""
+        <div class="legend-item">
+          <span class="legend-rect" style="background:{solar_bg_color(wm2)}"></span>
+          <span class="legend-text">{label}</span>
+        </div>
+        """
+        for wm2, label in solar_samples
+    )
+
+    if is_solar_view:
+        legend_html = f"""
+<div class="legend" aria-label="Legend">
+  <h3>Legend</h3>
+  <div class="legend-grid">
+    <div class="legend-block">
+      <div style="font-size:13px;font-weight:900;margin-bottom:8px;">Solar Irradiance</div>
+      <div class="legend-items">
+        {solar_legend_items}
+      </div>
+    </div>
+  </div>
+</div>
+"""
+    else:
+        legend_html = f"""
+<div class="legend" aria-label="Legend">
+  <h3>Legend</h3>
+  <div class="legend-grid">
+    <div class="legend-block">
+      <div style="font-size:13px;font-weight:900;margin-bottom:8px;">Chance of Rain</div>
+      <div class="legend-items">
+        {pill_legend_items}
+      </div>
+    </div>
+
+    <div class="legend-block">
+      <div style="font-size:13px;font-weight:900;margin-bottom:8px;">Rain Intensity</div>
+      <div class="legend-items">
+        {precip_legend_items}
+      </div>
+    </div>
+  </div>
+</div>
+"""
 
     html = f"""<!doctype html>
 <html>
@@ -675,6 +763,19 @@ td.time {{
   color:#111;
 }}
 
+.solar-val {{
+  display:inline-block;
+  min-width:56px;
+  padding:4px 8px;
+  border-radius:999px;
+  background:rgba(255,255,255,0.86);
+  box-shadow:0 1px 2px rgba(0,0,0,18);
+  color:#111;
+  font-size:13px;
+  font-weight:900;
+  line-height:1;
+}}
+
 /* Give each place column a minimum width so it stays readable */
 th:not(.timehead), td:not(.time) {{
   min-width:92px;
@@ -689,6 +790,7 @@ th:not(.timehead), td:not(.time) {{
   .pill .val {{ font-size:12px; }}
   .time-pill {{ font-size:12px; padding:3px 9px; }}
   .pill .pop {{ font-size:10px; padding:2px 5px; }}
+  .solar-val {{ font-size:12px; min-width:50px; padding:3px 7px; }}
 }}
 
 /* ---------- LEGEND ---------- */
@@ -778,11 +880,15 @@ th:not(.timehead), td:not(.time) {{
     {''.join(date_buttons)}
   </div>
 
+  <div class="dchips">
+    {''.join(view_buttons)}
+  </div>
+
   <a href="#" class="btn" id="downloadBtn">Download JPG</a>
 </div>
 
 <div class="table-wrap">
-  <table id="rainTable">
+  <table id="{table_id}">
     <tr>
       <th class="timehead">{forecast_label}</th>
       {''.join(f"<th>{p.label}</th>" for p in places)}
@@ -801,32 +907,39 @@ th:not(.timehead), td:not(.time) {{
         )
 
         for p in places:
-            icon, precip, pop = cell_map.get(p.label, {}).get(
-                t.strftime("%H:00"), ("—", 0.0, 0)
+            icon, precip, pop, solar = cell_map.get(p.label, {}).get(
+                t.strftime("%H:00"), ("—", 0.0, 0, 0.0)
             )
 
-            bg = precip_bg_color(precip)
-            val = precip_display(precip)
-
-            # Updated badge/pill color based on precipitation probability
-            pop_i = int(pop or 0)
-            if pop_i > 80:
-                pill_bg = POP_RED       # > 80
-            elif pop_i > 50:
-                pill_bg = POP_YELLOW    # 51–80
-            elif pop_i >= 30:
-                pill_bg = POP_GREEN     # 30–50
+            if is_solar_view:
+                html += (
+                    f"<td style='background:{solar_bg_color(solar)}'>"
+                    f"<span class='solar-val'>{solar_display(solar)}</span>"
+                    f"</td>"
+                )
             else:
-                pill_bg = POP_WHITE     # < 30
+                bg = precip_bg_color(precip)
+                val = precip_display(precip)
 
-            html += (
-                f"<td style='background:{bg}'>"
-                f"<span class='pill' style='background:{pill_bg}'>"
-                f"<span class='icon'>{icon}</span>"
-                f"<span class='val'>{val}</span>"
-                f"</span>"
-                f"</td>"
-            )
+                # Updated badge/pill color based on precipitation probability
+                pop_i = int(pop or 0)
+                if pop_i > 80:
+                    pill_bg = POP_RED       # > 80
+                elif pop_i > 50:
+                    pill_bg = POP_YELLOW    # 51–80
+                elif pop_i >= 30:
+                    pill_bg = POP_GREEN     # 30–50
+                else:
+                    pill_bg = POP_WHITE     # < 30
+
+                html += (
+                    f"<td style='background:{bg}'>"
+                    f"<span class='pill' style='background:{pill_bg}'>"
+                    f"<span class='icon'>{icon}</span>"
+                    f"<span class='val'>{val}</span>"
+                    f"</span>"
+                    f"</td>"
+                )
 
         html += "</tr>"
 
@@ -835,31 +948,14 @@ th:not(.timehead), td:not(.time) {{
 </div>
 
 <!-- LEGEND (after table) -->
-<div class="legend" aria-label="Legend">
-  <h3>Legend</h3>
-  <div class="legend-grid">
-    <div class="legend-block">
-      <div style="font-size:13px;font-weight:900;margin-bottom:8px;">Chance of Rain</div>
-      <div class="legend-items">
-        {pill_legend_items}
-      </div>
-    </div>
-
-    <div class="legend-block">
-      <div style="font-size:13px;font-weight:900;margin-bottom:8px;">Rain Intensity</div>
-      <div class="legend-items">
-        {precip_legend_items}
-      </div>
-    </div>
-  </div>
-</div>
+{legend_html}
 
 <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
 <script>
 document.getElementById("downloadBtn").addEventListener("click", function (e) {{
   e.preventDefault();
 
-  const table = document.getElementById("rainTable");
+  const table = document.getElementById("{table_id}");
 
   html2canvas(table, {{
     backgroundColor: "#ffffff",
@@ -869,7 +965,7 @@ document.getElementById("downloadBtn").addEventListener("click", function (e) {{
     const link = document.createElement("a");
     const d = new Date().toISOString().slice(0,10);
 
-    link.download = `rain-matrix-${{d}}.jpg`;
+    link.download = `{download_prefix}-${{d}}.jpg`;
     link.href = canvas.toDataURL("image/jpeg", 0.95);
     link.click();
   }});
@@ -895,6 +991,7 @@ def index():
     country = request.args.get("country", DEFAULT_COUNTRY)  # kept for URL/cache compatibility
     model = request.args.get("model", DEFAULT_MODEL)
     list_id = request.args.get("list")
+    view = normalized_view(request.args.get("view"))
 
     # Cache bypass
     nocache = request.args.get("nocache") == "1"
@@ -927,7 +1024,7 @@ def index():
     # Places file (NEW: coordinates-based)
     try:
         places, lists_info, active_list_id = read_places_file(DEFAULT_PLACES_FILE, list_id)
-        p_sig = places_signature(DEFAULT_PLACES_FILE, active_list_id)
+        p_sig = f"{places_signature(DEFAULT_PLACES_FILE, active_list_id)}:{view}"
     except FileNotFoundError:
         return Response(
             f"Missing places file: {DEFAULT_PLACES_FILE}\n"
@@ -952,6 +1049,8 @@ def index():
         "model": model,
         "list": active_list_id
     }
+    if view == "solar":
+        base_params["view"] = "solar"
     if nocache:
         base_params["nocache"] = "1"
 
@@ -972,16 +1071,22 @@ def index():
 
     client = OpenMeteoClient()
 
-    # cell_map[place_label][hour_key] = (icon, precip_mm, pop_pct)
-    cell_map: Dict[str, Dict[str, Tuple[str, float, int]]] = {}
+    # cell_map[place_label][hour_key] = (icon, precip_mm, pop_pct, solar_wm2)
+    cell_map: Dict[str, Dict[str, Tuple[str, float, int, float]]] = {}
     time_index: List[datetime] = []
     seen_hours = set()
 
     for p in places:
         hourly = client.hourly_forecast(p.lat, p.lon, tz, model)
-        cells: Dict[str, Tuple[str, float, int]] = {}
+        cells: Dict[str, Tuple[str, float, int, float]] = {}
 
-        for t, pr, pop, cc in zip(hourly["time"], hourly["precip"], hourly["pop"], hourly["cloud"]):
+        for t, pr, pop, cc, solar in zip(
+            hourly["time"],
+            hourly["precip"],
+            hourly["pop"],
+            hourly["cloud"],
+            hourly["solar"],
+        ):
             if t.date() != target_date:
                 continue
 
@@ -990,7 +1095,7 @@ def index():
                 seen_hours.add(hk)
                 time_index.append(t)
 
-            cells[hk] = (weather_icon(cc, pr, t), pr, int(pop or 0))
+            cells[hk] = (weather_icon(cc, pr, t), pr, int(pop or 0), _to_float(solar))
 
         cell_map[p.label] = cells
 
@@ -1011,6 +1116,7 @@ def index():
         from_cache=False,
         nocache=nocache,
         base_params=base_params,
+        view=view,
     )
 
     # Store in cache (only if not nocache)

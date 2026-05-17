@@ -34,6 +34,8 @@ construction/
 # Database / local data
 # =========================
 *.sqlite
+*.sqlite3-shm
+*.sqlite3-wal
 *.db
 
 # =========================
