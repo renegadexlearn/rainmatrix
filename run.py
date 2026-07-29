@@ -54,6 +54,7 @@ MODERATE_MAX = 7.5
 
 SCALE_MAX_MM = 7.0
 SOLAR_SCALE_MAX_WM2 = 1000.0
+SOLAR_TOTAL_CACHE_VERSION = "solar-total-v1"
 
 SKYBLUE = "#87CEEB"
 VIOLET = "#8A2BE2"
@@ -187,6 +188,10 @@ def solar_bg_color(watts_m2: float) -> str:
 def solar_display(watts_m2: float) -> str:
     w = _to_float(watts_m2)
     return "-" if w <= 0 else f"{round(w):.0f}"
+
+
+def solar_total_display(watts_m2: float) -> str:
+    return f"{round(max(0.0, _to_float(watts_m2))):.0f}"
 
 
 def time_bg_color(dt: datetime) -> str:
@@ -776,6 +781,24 @@ td.time {{
   line-height:1;
 }}
 
+.total-label {{
+  background:#111827 !important;
+  color:#fff;
+}}
+
+.total-pill {{
+  display:inline-block;
+  min-width:64px;
+  padding:5px 10px;
+  border-radius:999px;
+  background:#111827;
+  color:#fff;
+  box-shadow:0 1px 2px rgba(0,0,0,22);
+  font-size:13px;
+  font-weight:900;
+  line-height:1;
+}}
+
 /* Give each place column a minimum width so it stays readable */
 th:not(.timehead), td:not(.time) {{
   min-width:92px;
@@ -791,6 +814,7 @@ th:not(.timehead), td:not(.time) {{
   .time-pill {{ font-size:12px; padding:3px 9px; }}
   .pill .pop {{ font-size:10px; padding:2px 5px; }}
   .solar-val {{ font-size:12px; min-width:50px; padding:3px 7px; }}
+  .total-pill {{ font-size:12px; min-width:56px; padding:4px 8px; }}
 }}
 
 /* ---------- LEGEND ---------- */
@@ -943,6 +967,27 @@ th:not(.timehead), td:not(.time) {{
 
         html += "</tr>"
 
+    if is_solar_view:
+        html += (
+            "<tr>"
+            "<td class='time total-label'>"
+            "<span class='time-pill'>TOTAL</span>"
+            "</td>"
+        )
+
+        for p in places:
+            total_solar = sum(
+                cell_map.get(p.label, {}).get(t.strftime("%H:00"), ("—", 0.0, 0, 0.0))[3]
+                for t in time_index
+            )
+            html += (
+                "<td class='total-cell'>"
+                f"<span class='total-pill'>{solar_total_display(total_solar)}</span>"
+                "</td>"
+            )
+
+        html += "</tr>"
+
     html += f"""
   </table>
 </div>
@@ -1024,7 +1069,7 @@ def index():
     # Places file (NEW: coordinates-based)
     try:
         places, lists_info, active_list_id = read_places_file(DEFAULT_PLACES_FILE, list_id)
-        p_sig = f"{places_signature(DEFAULT_PLACES_FILE, active_list_id)}:{view}"
+        p_sig = f"{places_signature(DEFAULT_PLACES_FILE, active_list_id)}:{view}:{SOLAR_TOTAL_CACHE_VERSION}"
     except FileNotFoundError:
         return Response(
             f"Missing places file: {DEFAULT_PLACES_FILE}\n"
