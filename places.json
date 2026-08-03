@@ -63,5 +63,46 @@
         }
       ]
     }
+  ],
+  "sites": [
+    {
+      "charge_first": false,
+      "consumption_kwh_per_hour": 12,
+      "efficiency_factor": 0.7,
+      "id": "site_1785639554884",
+      "initial_soc_percent": 20,
+      "lat": 13.416,
+      "lon": 121.161,
+      "max_charging_ampere": 1110,
+      "name": "CAL Tree of Life",
+      "system_kw": 98.28,
+      "total_battery_capacity_ah": 7536
+    },
+    {
+      "charge_first": false,
+      "consumption_kwh_per_hour": 12,
+      "efficiency_factor": 0.7,
+      "id": "site_1785714098214",
+      "initial_soc_percent": 20,
+      "lat": 13.416,
+      "lon": 121.161,
+      "max_charging_ampere": 540,
+      "name": "CAL Tawiran Deye",
+      "system_kw": 43.2,
+      "total_battery_capacity_ah": 2512
+    },
+    {
+      "id": "site_1785738202952",
+      "name": "CAL Tawiran SRNE",
+      "system_kw": 25.2,
+      "efficiency_factor": 0.7,
+      "total_battery_capacity_ah": 1884,
+      "max_charging_ampere": 220,
+      "initial_soc_percent": 20,
+      "consumption_kwh_per_hour": 6,
+      "charge_first": true,
+      "lat": 13.416,
+      "lon": 121.161
+    }
   ]
 }
