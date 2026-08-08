@@ -23,14 +23,18 @@ from __future__ import annotations
 import os
 import sqlite3
 import json
+import calendar as calendar_lib
 import html as html_lib
+import statistics
+from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import requests
 from flask import Flask, request, Response
+from openpyxl import load_workbook
 
 try:
     from zoneinfo import ZoneInfo
@@ -55,8 +59,15 @@ MODERATE_MAX = 7.5
 
 SCALE_MAX_MM = 7.0
 SOLAR_SCALE_MAX_WM2 = 1000.0
-SOLAR_TOTAL_CACHE_VERSION = "solar-total-v1"
+SOLAR_TOTAL_CACHE_VERSION = "solar-total-v2"
 BATTERY_NOMINAL_VOLTAGE = 51.2
+RAIN_RETAINED_ENERGY_FLOOR = 0.12
+SMART_RAIN_MIN_MM = 0.05
+SMART_RAIN_MIN_PROBABILITY = 30.0
+MAX_INVERTER_SAMPLE_GAP_MINUTES = 20.0
+INVERTER_DAY_COMPLETE_HOUR = 18
+SOLAR_CALIBRATION_MIN_DAYS = 3
+SOLAR_CALIBRATION_LOOKBACK_DAYS = 90
 
 SKYBLUE = "#87CEEB"
 VIOLET = "#8A2BE2"
@@ -81,7 +92,7 @@ WEATHER_ICONS_NO_RAIN = {
 }
 
 # SQLite cache DB path (override via env var)
-CACHE_DB_PATH = os.environ.get("RAIN_CACHE_DB", "rain_cache.sqlite3")
+CACHE_DB_PATH = os.path.abspath(os.environ.get("RAIN_CACHE_DB", "rain_cache.sqlite3"))
 
 # Cache policy
 CACHE_TTL_SECONDS = 60 * 60          # 1 hour
@@ -297,14 +308,150 @@ def read_sites_file(path: str) -> List[Dict[str, object]]:
     return sites if isinstance(sites, list) else []
 
 
+_INVERTER_FILE_CACHE: Dict[str, Tuple[Tuple[int, int], Dict[str, object]]] = {}
+
+
+def _parse_inverter_time(value: object) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    if not value:
+        return None
+    text = str(value).strip()
+    for time_format in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, time_format)
+        except ValueError:
+            continue
+    return None
+
+
+def inverter_actuals_for_file(path: str) -> Dict[str, object]:
+    empty = {"hourly": {}, "daily": {}, "last_reading": None, "source": ""}
+    if not path:
+        return empty
+
+    resolved_path = os.path.abspath(path)
+    try:
+        stat = os.stat(resolved_path)
+    except OSError:
+        return empty
+
+    signature = (stat.st_mtime_ns, stat.st_size)
+    cached = _INVERTER_FILE_CACHE.get(resolved_path)
+    if cached and cached[0] == signature:
+        return cached[1]
+
+    points_by_time: Dict[datetime, float] = {}
+    workbook = load_workbook(resolved_path, read_only=True, data_only=True)
+    try:
+        for sheet in workbook.worksheets:
+            rows = sheet.iter_rows(values_only=True)
+            headers = next(rows, None)
+            if not headers:
+                continue
+            normalized_headers = [
+                str(value or "").strip().lower().replace("（", "(").replace("）", ")")
+                for value in headers
+            ]
+            time_index = next((i for i, value in enumerate(normalized_headers) if value == "time"), None)
+            solar_index = next(
+                (i for i, value in enumerate(normalized_headers) if value.startswith("solar power")),
+                None,
+            )
+            weather_index = next(
+                (i for i, value in enumerate(normalized_headers) if value == "weather"),
+                None,
+            )
+            soc_index = next(
+                (i for i, value in enumerate(normalized_headers) if value.startswith("soc")),
+                None,
+            )
+            if time_index is None or solar_index is None:
+                continue
+
+            for row in rows:
+                reading_time = _parse_inverter_time(row[time_index])
+                if reading_time is None:
+                    continue
+                weather_value = row[weather_index] if weather_index is not None else None
+                soc_value = row[soc_index] if soc_index is not None else 1
+                if weather_value and soc_value is None:
+                    continue
+                try:
+                    solar_power_kw = max(0.0, float(row[solar_index] or 0.0))
+                except (TypeError, ValueError):
+                    continue
+                points_by_time[reading_time] = solar_power_kw
+    finally:
+        workbook.close()
+
+    points = sorted(points_by_time.items())
+    hourly_energy: Dict[datetime, float] = defaultdict(float)
+    hourly_coverage_seconds: Dict[datetime, float] = defaultdict(float)
+    for (start, start_kw), (end, end_kw) in zip(points, points[1:]):
+        interval_seconds = (end - start).total_seconds()
+        if interval_seconds <= 0 or interval_seconds > MAX_INVERTER_SAMPLE_GAP_MINUTES * 60.0:
+            continue
+        cursor = start
+        while cursor < end:
+            hour_start = cursor.replace(minute=0, second=0, microsecond=0)
+            boundary = min(end, hour_start + timedelta(hours=1))
+            start_fraction = (cursor - start).total_seconds() / interval_seconds
+            end_fraction = (boundary - start).total_seconds() / interval_seconds
+            cursor_kw = start_kw + ((end_kw - start_kw) * start_fraction)
+            boundary_kw = start_kw + ((end_kw - start_kw) * end_fraction)
+            segment_seconds = (boundary - cursor).total_seconds()
+            hourly_energy[hour_start] += ((cursor_kw + boundary_kw) / 2.0) * (segment_seconds / 3600.0)
+            hourly_coverage_seconds[hour_start] += segment_seconds
+            cursor = boundary
+
+    hourly = {
+        hour: {
+            "kwh": max(0.0, energy),
+            "coverage_minutes": min(hourly_coverage_seconds[hour] / 60.0, 60.0),
+        }
+        for hour, energy in hourly_energy.items()
+    }
+    last_by_day: Dict[date, datetime] = {}
+    for reading_time, _power in points:
+        last_by_day[reading_time.date()] = max(
+            last_by_day.get(reading_time.date(), reading_time),
+            reading_time,
+        )
+    daily = {
+        reading_day: {
+            "kwh": sum(
+                _to_float(values.get("kwh"))
+                for hour, values in hourly.items()
+                if hour.date() == reading_day
+            ),
+            "last_reading": last_reading,
+            "complete": last_reading.hour >= INVERTER_DAY_COMPLETE_HOUR,
+        }
+        for reading_day, last_reading in last_by_day.items()
+    }
+    result = {
+        "hourly": hourly,
+        "daily": daily,
+        "last_reading": points[-1][0] if points else None,
+        "source": os.path.basename(resolved_path),
+    }
+    _INVERTER_FILE_CACHE[resolved_path] = (signature, result)
+    return result
+
+
 def safe_now_date_in_tz(tz_name: str) -> date:
+    return safe_now_in_tz(tz_name).date()
+
+
+def safe_now_in_tz(tz_name: str) -> datetime:
     if ZoneInfo is None:
-        return datetime.now().date()
+        return datetime.now()
 
     try:
-        return datetime.now(ZoneInfo(tz_name)).date()
+        return datetime.now(ZoneInfo(tz_name)).replace(tzinfo=None)
     except Exception:
-        return datetime.now().date()
+        return datetime.now()
 
 
 def build_url(base_params: Dict[str, str], new_date: Optional[date]) -> str:
@@ -329,6 +476,57 @@ def normalize_efficiency_factor(value: float) -> float:
 
 def daily_solar_production_kwh(system_kw: float, irradiation_wh_m2: float, efficiency_factor: float) -> float:
     return max(0.0, system_kw) * (max(0.0, irradiation_wh_m2) / 1000.0) * normalize_efficiency_factor(efficiency_factor)
+
+
+def rain_retained_energy_factor(precipitation_mm: float, precipitation_probability_pct: float) -> float:
+    """Return the conservative share of forecast solar energy retained during rain."""
+    rain_probability = min(max(_to_float(precipitation_probability_pct) / 100.0, 0.0), 1.0)
+    rain_intensity = min(max(_to_float(precipitation_mm), 0.0) / 2.0, 1.0)
+
+    # Probability handles scattered tropical rain that models often understate in mm.
+    # Intensity supplies the extra loss once meaningful rainfall is forecast.
+    loss = (0.88 * rain_probability) + (0.08 * rain_intensity)
+    return max(RAIN_RETAINED_ENERGY_FLOOR, min(1.0 - loss, 1.0))
+
+
+def smart_hourly_rain_adjustment(
+        precipitation_mm: float,
+        precipitation_probability_pct: float,
+    ) -> Tuple[str, float]:
+    """Classify one forecast hour and return its retained solar-energy share."""
+    precipitation = max(0.0, _to_float(precipitation_mm))
+    probability = min(max(_to_float(precipitation_probability_pct), 0.0), 100.0)
+    if precipitation < SMART_RAIN_MIN_MM or probability < SMART_RAIN_MIN_PROBABILITY:
+        return "dry", 1.0
+
+    probability_weight = probability / 100.0
+    intensity_weight = min(precipitation / 2.0, 1.0)
+    # Inverter readings from CAL Tree of Life show that satellite radiation
+    # remains optimistic during sustained tropical rain. Weight probability
+    # strongly, then use hourly intensity to deepen the loss.
+    loss = (0.80 * probability_weight) + (0.20 * intensity_weight)
+    retained = max(RAIN_RETAINED_ENERGY_FLOOR, min(1.0 - loss, 1.0))
+
+    if probability >= 80.0 and precipitation >= 1.0:
+        return "heavy", retained
+    if probability >= 60.0 and precipitation >= 0.3:
+        return "likely", retained
+    return "light", retained
+
+
+def hourly_solar_production_kwh(
+        system_kw: float,
+        radiation_w_m2: float,
+        efficiency_factor: float,
+        precipitation_mm: float = 0.0,
+        precipitation_probability_pct: float = 0.0,
+        rain_effect: bool = False,
+        calibration_factor: float = 1.0,
+    ) -> float:
+    production = daily_solar_production_kwh(system_kw, radiation_w_m2, efficiency_factor)
+    if rain_effect:
+        production *= rain_retained_energy_factor(precipitation_mm, precipitation_probability_pct)
+    return max(0.0, production * max(0.0, _to_float(calibration_factor, 1.0)))
 
 
 def production_bar_color(kwh: float, max_kwh: float) -> str:
@@ -389,13 +587,13 @@ class OpenMeteoClient:
         params = {
             "latitude": lat,
             "longitude": lon,
-            "hourly": "precipitation,precipitation_probability,cloudcover,shortwave_radiation",
+            "hourly": "precipitation,precipitation_probability,cloud_cover,shortwave_radiation",
             "timezone": tz,
             "forecast_days": 7,
             "models": model,
         }
         r = self.session.get(
-            "https://api.open-meteo.com/v1/dwd-icon",
+            "https://api.open-meteo.com/v1/forecast",
             params=params,
             timeout=self.timeout,
         )
@@ -405,9 +603,222 @@ class OpenMeteoClient:
             "time": [datetime.fromisoformat(t) for t in h["time"]],
             "precip": h["precipitation"],
             "pop": h.get("precipitation_probability") or [0] * len(h["time"]),
-            "cloud": h["cloudcover"],
+            "cloud": h["cloud_cover"],
             "solar": h.get("shortwave_radiation") or [0] * len(h["time"]),
         }
+
+    def satellite_radiation_today(self, lat: float, lon: float, tz: str):
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "hourly": "shortwave_radiation",
+            "timezone": tz,
+            "forecast_days": 1,
+        }
+        r = self.session.get(
+            "https://satellite-api.open-meteo.com/v1/archive",
+            params=params,
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        h = r.json()["hourly"]
+        return {
+            "time": [datetime.fromisoformat(t) for t in h["time"]],
+            "solar": h.get("shortwave_radiation") or [0] * len(h["time"]),
+        }
+
+    def hybrid_solar_forecast(self, lat: float, lon: float, tz: str, model: str):
+        hourly = self.hourly_forecast(lat, lon, tz, model)
+        now = safe_now_in_tz(tz)
+        completed_hour = now.replace(minute=0, second=0, microsecond=0)
+        hourly["solar_source"] = ["forecast"] * len(hourly["time"])
+
+        try:
+            satellite = self.satellite_radiation_today(lat, lon, tz)
+        except Exception:
+            return hourly
+
+        satellite_by_time = {
+            t: max(0.0, _to_float(solar))
+            for t, solar in zip(satellite["time"], satellite["solar"])
+            if t.date() == now.date() and t <= completed_hour and solar is not None
+        }
+        if not satellite_by_time:
+            return hourly
+
+        hourly["solar"] = [
+            satellite_by_time.get(t, max(0.0, _to_float(solar)))
+            if t.date() == now.date()
+            else max(0.0, _to_float(solar))
+            for t, solar in zip(hourly["time"], hourly["solar"])
+        ]
+        hourly["solar_source"] = [
+            "nowcast" if t in satellite_by_time else "forecast"
+            for t in hourly["time"]
+        ]
+        return hourly
+
+    def add_rain_model_scenarios(
+            self,
+            hourly: Dict[str, object],
+            lat: float,
+            lon: float,
+            tz: str,
+            primary_model: str = DEFAULT_MODEL,
+        ):
+        if hourly.get("rain_solar"):
+            return hourly
+
+        primary_solar = hourly.get("solar") or []
+        model_series = [(primary_model, hourly)]
+        for backup_model in ("gfs_global", "icon_seamless", "gem_global"):
+            try:
+                model_series.append(
+                    (backup_model, self.hourly_forecast(lat, lon, tz, backup_model))
+                )
+            except Exception:
+                continue
+
+        model_labels = {
+            "ecmwf_ifs": "ECMWF",
+            "best_match": "Best match",
+            "gfs_global": "GFS",
+            "icon_seamless": "ICON",
+            "gem_global": "GEM",
+        }
+
+        def hourly_candidates(model_name: str, series: Dict[str, object]):
+            candidates = {}
+            solar_sources = series.get("solar_source") or ["forecast"] * len(series["time"])
+            for t, solar, precipitation, probability, solar_source in zip(
+                series["time"],
+                series["solar"],
+                series["precip"],
+                series["pop"],
+                solar_sources,
+            ):
+                if solar is None:
+                    continue
+                raw_solar = max(0.0, _to_float(solar))
+                rain_mm = max(0.0, _to_float(precipitation))
+                rain_pop = min(max(_to_float(probability), 0.0), 100.0)
+                rain_level, retained_factor = smart_hourly_rain_adjustment(rain_mm, rain_pop)
+                candidates[t] = {
+                    "model": model_labels.get(model_name, model_name.replace("_", " ").title()),
+                    "raw": raw_solar,
+                    "adjusted": raw_solar * retained_factor,
+                    "precip": rain_mm,
+                    "pop": rain_pop,
+                    "rain_level": rain_level,
+                    "retained_factor": retained_factor,
+                    "source": solar_source,
+                }
+            return candidates
+
+        candidates_by_model = [
+            hourly_candidates(model_name, series)
+            for model_name, series in model_series
+        ]
+
+        expected_solar = []
+        conservative_solar = []
+        upper_solar = []
+        scenario_used = []
+        hourly_precip = []
+        hourly_pop = []
+        selected_models = []
+        interpretations = []
+        rain_levels = []
+        retained_factors = []
+        primary_sources = hourly.get("solar_source") or ["forecast"] * len(hourly["time"])
+        for t, primary, primary_source in zip(hourly["time"], primary_solar, primary_sources):
+            candidates = [model_values[t] for model_values in candidates_by_model if t in model_values]
+            if primary_source == "nowcast" and candidates:
+                selected = candidates[0]
+                rain_mm = selected["precip"]
+                rain_pop = selected["pop"]
+                rain_level, retained_factor = smart_hourly_rain_adjustment(rain_mm, rain_pop)
+                expected = selected["raw"] * retained_factor
+                scenario_values = [expected]
+                model_label = "Satellite nowcast"
+                interpretation = (
+                    "Satellite sunlight is not site meter output; hourly rain penalty applied."
+                    if retained_factor < 1.0
+                    else "Satellite sunlight used; the hourly rain signal is too small for a penalty."
+                )
+            elif candidates:
+                rain_mm = statistics.median(candidate["precip"] for candidate in candidates)
+                rain_pop = statistics.median(candidate["pop"] for candidate in candidates)
+                rain_level, consensus_factor = smart_hourly_rain_adjustment(rain_mm, rain_pop)
+
+                if rain_level == "dry":
+                    scenario_values = [candidate["raw"] for candidate in candidates]
+                    target = statistics.median(scenario_values)
+                    selected = min(candidates, key=lambda candidate: (abs(candidate["raw"] - target), candidate["raw"]))
+                    expected = selected["raw"]
+                    retained_factor = 1.0
+                    interpretation = "Rain signal is too small; solar forecast used without a rain penalty."
+                else:
+                    scenario_values = [candidate["raw"] * consensus_factor for candidate in candidates]
+                    ordered = sorted(candidates, key=lambda candidate: candidate["raw"])
+                    if rain_level == "heavy":
+                        selected = ordered[0]
+                        interpretation = "Heavy rain is likely; the lowest adjusted model is used."
+                    elif rain_level == "likely":
+                        selected = ordered[max(0, (len(ordered) - 1) // 2)]
+                        interpretation = "Rain is likely; a lower-middle adjusted model is used."
+                    else:
+                        target = statistics.median(scenario_values)
+                        selected = min(
+                            candidates,
+                            key=lambda candidate: (
+                                abs((candidate["raw"] * consensus_factor) - target),
+                                candidate["raw"],
+                            ),
+                        )
+                        interpretation = "Light or uncertain rain; the middle adjusted model is used."
+                    expected = selected["raw"] * consensus_factor
+                    retained_factor = consensus_factor
+                model_label = selected["model"]
+                if rain_level != "dry" and retained_factor >= 0.995:
+                    interpretation = (
+                        "Rain signals disagree; the selected model needs no extra rain penalty."
+                    )
+            else:
+                expected = max(0.0, _to_float(primary))
+                scenario_values = [expected]
+                rain_mm = 0.0
+                rain_pop = 0.0
+                rain_level = "dry"
+                retained_factor = 1.0
+                model_label = model_labels.get(primary_model, "Primary")
+                interpretation = "Only the primary solar forecast is available."
+
+            expected_solar.append(expected)
+            conservative_solar.append(min(scenario_values))
+            upper_solar.append(max(scenario_values))
+            scenario_used.append(
+                len(scenario_values) > 1 and (max(scenario_values) - min(scenario_values)) > 0.01
+            )
+            hourly_precip.append(rain_mm)
+            hourly_pop.append(rain_pop)
+            selected_models.append(model_label)
+            interpretations.append(interpretation)
+            rain_levels.append(rain_level)
+            retained_factors.append(retained_factor)
+
+        hourly["rain_solar"] = expected_solar
+        hourly["rain_conservative_solar"] = conservative_solar
+        hourly["rain_upper_solar"] = upper_solar
+        hourly["rain_consensus_used"] = scenario_used
+        hourly["rain_model_count"] = len(candidates_by_model)
+        hourly["rain_adjustment_precip"] = hourly_precip
+        hourly["rain_adjustment_pop"] = hourly_pop
+        hourly["rain_selected_model"] = selected_models
+        hourly["rain_interpretation"] = interpretations
+        hourly["rain_level"] = rain_levels
+        hourly["rain_retained_factor"] = retained_factors
+        return hourly
 
 
 # ---------------- CACHE (SQLite) ----------------
@@ -417,6 +828,44 @@ def cache_connect() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
+
+
+def ensure_solar_history_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS solar_production_history (
+          site_id                TEXT NOT NULL,
+          production_date        TEXT NOT NULL,
+          base_forecast_kwh      REAL,
+          rain_forecast_kwh      REAL,
+          base_display_kwh       REAL,
+          rain_display_kwh       REAL,
+          source_type            TEXT,
+          last_queried_at         TEXT,
+          actual_kwh             REAL,
+          forecast_recorded_at   TEXT,
+          actual_recorded_at     TEXT,
+          PRIMARY KEY (site_id, production_date)
+        )
+        """
+    )
+    history_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(solar_production_history)").fetchall()
+    }
+    for column, column_type in (
+        ("base_display_kwh", "REAL"),
+        ("rain_display_kwh", "REAL"),
+        ("source_type", "TEXT"),
+        ("last_queried_at", "TEXT"),
+    ):
+        if column in history_columns:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE solar_production_history ADD COLUMN {column} {column_type}")
+        except sqlite3.OperationalError as error:
+            if "duplicate column name" not in str(error).lower():
+                raise
 
 
 def cache_init() -> None:
@@ -436,6 +885,7 @@ def cache_init() -> None:
             )
             """
         )
+        ensure_solar_history_schema(conn)
     cache_prune()
 
 
@@ -474,7 +924,7 @@ def cache_get(query_date: str, target_date: str, tz: str, country: str, model: s
             # If parsing fails, treat as expired to force refresh
             return None
 
-        age = datetime.utcnow() - created_dt
+        age = datetime.now(timezone.utc).replace(tzinfo=None) - created_dt
         if age.total_seconds() > CACHE_TTL_SECONDS:
             return None
 
@@ -498,9 +948,113 @@ def cache_put(query_date: str, target_date: str, tz: str, country: str, model: s
                 model,
                 places_sig,
                 html,
-                datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             ),
         )
+
+
+def solar_history_record_forecasts(site_id: str, daily_rows: List[Dict[str, object]]) -> None:
+    if not site_id:
+        return
+
+    recorded_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    rows = []
+    for row in daily_rows:
+        production_day = row.get("date")
+        if not isinstance(production_day, date):
+            continue
+        rows.append(
+            (
+                site_id,
+                production_day.isoformat(),
+                max(0.0, _to_float(row.get("base_forecast_kwh"))),
+                max(0.0, _to_float(row.get("rain_forecast_kwh"))),
+                max(0.0, _to_float(row.get("base_display_kwh"))),
+                max(0.0, _to_float(row.get("rain_display_kwh"))),
+                str(row.get("source_type") or "forecast"),
+                (
+                    max(0.0, _to_float(row.get("inverter_actual_kwh")))
+                    if row.get("inverter_actual_complete")
+                    else None
+                ),
+                recorded_at,
+                recorded_at,
+                recorded_at if row.get("inverter_actual_complete") else None,
+            )
+        )
+
+    if not rows:
+        return
+
+    with cache_connect() as conn:
+        ensure_solar_history_schema(conn)
+        conn.executemany(
+            """
+            INSERT INTO solar_production_history
+              (site_id, production_date, base_forecast_kwh, rain_forecast_kwh,
+               base_display_kwh, rain_display_kwh, source_type,
+               actual_kwh, forecast_recorded_at, last_queried_at, actual_recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(site_id, production_date) DO UPDATE SET
+              base_forecast_kwh=excluded.base_forecast_kwh,
+              rain_forecast_kwh=excluded.rain_forecast_kwh,
+              base_display_kwh=excluded.base_display_kwh,
+              rain_display_kwh=excluded.rain_display_kwh,
+              source_type=excluded.source_type,
+              actual_kwh=COALESCE(excluded.actual_kwh, solar_production_history.actual_kwh),
+              actual_recorded_at=COALESCE(excluded.actual_recorded_at, solar_production_history.actual_recorded_at),
+              last_queried_at=excluded.last_queried_at
+            """,
+            rows,
+        )
+
+
+def solar_history_for_month(site_id: str, month_start: date) -> Dict[str, Dict[str, object]]:
+    month_end = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+    with cache_connect() as conn:
+        ensure_solar_history_schema(conn)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT production_date, base_display_kwh, rain_display_kwh,
+                   source_type, last_queried_at
+            FROM solar_production_history
+            WHERE site_id=? AND production_date>=? AND production_date<?
+            ORDER BY production_date
+            """,
+            (site_id, month_start.isoformat(), month_end.isoformat()),
+        ).fetchall()
+    return {str(row["production_date"]): dict(row) for row in rows}
+
+
+def solar_calibration_factor(site_id: str, rain_effect: bool, today: date) -> Tuple[float, int]:
+    if not site_id:
+        return 1.0, 0
+
+    forecast_column = "rain_forecast_kwh" if rain_effect else "base_forecast_kwh"
+    cutoff = today - timedelta(days=SOLAR_CALIBRATION_LOOKBACK_DAYS)
+    with cache_connect() as conn:
+        ensure_solar_history_schema(conn)
+        rows = conn.execute(
+            f"""
+            SELECT actual_kwh, {forecast_column}
+            FROM solar_production_history
+            WHERE site_id=?
+              AND production_date>=?
+              AND production_date<?
+              AND actual_kwh IS NOT NULL
+              AND {forecast_column}>0
+            ORDER BY production_date DESC
+            """,
+            (site_id, cutoff.isoformat(), today.isoformat()),
+        ).fetchall()
+
+    ratios = [actual / forecast for actual, forecast in rows if actual >= 0 and forecast > 0]
+    if len(ratios) < SOLAR_CALIBRATION_MIN_DAYS:
+        return 1.0, len(ratios)
+
+    factor = statistics.median(ratios)
+    return min(max(factor, 0.35), 1.40), len(ratios)
 
 
 # ---------------- HTML RENDER ----------------
@@ -1027,6 +1581,7 @@ th:not(.timehead), td:not(.time) {{
             "</td>"
         )
 
+
         for p in places:
             total_solar = sum(
                 cell_map.get(p.label, {}).get(t.strftime("%H:00"), ("—", 0.0, 0, 0.0))[3]
@@ -1079,14 +1634,24 @@ def render_solar_site_html(
         site_name: str,
         site_id: str,
         sites: List[Dict[str, object]],
+        tz: str,
         model: str,
         daily_rows: List[Dict[str, object]],
         battery_days: List[Dict[str, object]],
+        hourly_days: List[Dict[str, object]],
         battery_capacity_ah: float,
         max_charging_ampere: float,
         initial_soc_percent: float,
+        stop_discharge_soc_percent: float,
         consumption_kwh_per_hour: float,
         charge_first: bool,
+        rain_effect: bool,
+        calibration_factor: float,
+        calibration_days: int,
+        history_month: date,
+        history_rows: Dict[str, Dict[str, object]],
+        inverter_note: str,
+        today: date,
     ) -> str:
     safe_name = html_lib.escape(site_name)
     max_kwh = max((_to_float(row["production_kwh"]) for row in daily_rows), default=0.0)
@@ -1117,7 +1682,7 @@ def render_solar_site_html(
         grid_lines_html += f'<span class="grid-line" style="top:{grid_top:.2f}px;"></span>'
 
     bars_html = ""
-    for row in daily_rows:
+    for day_index, row in enumerate(daily_rows):
         day = row["date"]
         if isinstance(day, date):
             date_label = day.strftime("%b%d")
@@ -1127,11 +1692,22 @@ def render_solar_site_html(
             weekday_label = ""
 
         production_kwh = _to_float(row["production_kwh"])
+        base_forecast_kwh = _to_float(row.get("base_display_kwh"))
+        rain_forecast_kwh = _to_float(row.get("rain_display_kwh"))
         bar_height = (production_kwh / axis_max) * 100.0 if axis_max else 0.0
         bg = production_bar_color(production_kwh, max_kwh)
         value_label = f"{int(round(production_kwh)):,}"
+        conservative_kwh = _to_float(row.get("conservative_display_kwh"), rain_forecast_kwh)
+        upper_kwh = _to_float(row.get("upper_display_kwh"), rain_forecast_kwh)
+        comparison_label = (
+            f"Range {int(round(conservative_kwh)):,}-{int(round(upper_kwh)):,} kWh"
+            if rain_effect
+            else f"Rain-aware {int(round(rain_forecast_kwh)):,} kWh"
+        )
         bars_html += f"""
-        <div class="bar-slot">
+        <button type="button" class="bar-slot day-bar" data-hourly-index="{day_index}"
+                aria-controls="hourlyForecastCard" aria-pressed="{'true' if day_index == 0 else 'false'}"
+                title="View {date_label} hourly forecast">
           <div class="bar-value">{value_label}</div>
           <div class="bar-track" aria-label="{date_label} estimated production {value_label} kWh">
             <div class="bar-fill" style="height:{bar_height:.2f}%;background:{bg};"></div>
@@ -1139,9 +1715,118 @@ def render_solar_site_html(
           <div class="x-label">
             <span>{date_label}</span>
             <strong>{weekday_label}</strong>
+            <small>{comparison_label}</small>
           </div>
+        </button>
+"""
+
+    mode_name = "Smart rain v7" if rain_effect else "Standard v1"
+    rain_model_count = max(
+        (int(_to_float(row.get("rain_model_count"), 1.0)) for row in daily_rows),
+        default=1,
+    )
+    method_note = (
+        f"Smart model chosen each hour from {rain_model_count} weather models"
+        if rain_effect
+        else "Rain effect is off"
+    )
+    calibration_note = (
+        f"Site calibration: {calibration_factor:.2f}x from {calibration_days} measured days"
+        if calibration_days >= SOLAR_CALIBRATION_MIN_DAYS
+        else (
+            f"Site calibration: learning ({calibration_days}/{SOLAR_CALIBRATION_MIN_DAYS} completed inverter days)"
+            if inverter_note
+            else "Site calibration: default (no measured production feed)"
+        )
+    )
+    inverter_status_html = (
+        f"<span>{html_lib.escape(inverter_note)}</span>"
+        if inverter_note
+        else ""
+    )
+    today_row = next((row for row in daily_rows if row.get("date") == today), None)
+    today_progress_html = ""
+    if today_row:
+        by_now_kwh = max(0.0, _to_float(today_row.get("estimated_by_now_kwh")))
+        remaining_kwh = max(0.0, _to_float(today_row.get("remaining_today_kwh")))
+        full_day_kwh = max(0.0, _to_float(today_row.get("production_kwh")))
+        by_now_label = (
+            "Inverter actual by now"
+            if _to_float(today_row.get("has_inverter_actual")) > 0
+            else "Estimated by now"
+        )
+        conservative_kwh = max(0.0, _to_float(today_row.get("conservative_display_kwh")))
+        upper_kwh = max(0.0, _to_float(today_row.get("upper_display_kwh")))
+        consensus_note = (
+            f"Expected range: {conservative_kwh:,.1f}-{upper_kwh:,.1f} kWh"
+            if rain_effect
+            else mode_name
+        )
+        today_progress_html = f"""
+        <div class="today-progress">
+          <span><small>{by_now_label}</small><strong>{by_now_kwh:,.1f} kWh</strong></span>
+          <span><small>Remaining today</small><strong>{remaining_kwh:,.1f} kWh</strong></span>
+          <span><small>Full-day estimate</small><strong>{full_day_kwh:,.1f} kWh</strong></span>
+          <em>{consensus_note}</em>
         </div>
 """
+
+    history_forecast_key = "rain_display_kwh" if rain_effect else "base_display_kwh"
+    history_cells = ""
+    history_values: List[float] = []
+    month_calendar = calendar_lib.Calendar(firstweekday=0)
+    for calendar_day in [day for week in month_calendar.monthdatescalendar(history_month.year, history_month.month) for day in week]:
+        if calendar_day.month != history_month.month:
+            history_cells += '<div class="calendar-day outside" aria-hidden="true"></div>'
+            continue
+
+        history = history_rows.get(calendar_day.isoformat(), {})
+        production = history.get(history_forecast_key)
+        source_type = str(history.get("source_type") or "forecast").lower()
+        source_label = {
+            "actual": "Inverter actual",
+            "actual + forecast": "Actual + forecast",
+            "nowcast": "Nowcast",
+        }.get(source_type, "Forecast")
+        is_today = " today" if calendar_day == today else ""
+        if production is not None:
+            production_value = max(0.0, _to_float(production))
+            history_values.append(production_value)
+            production_html = f'<strong>{production_value:,.1f}<span> kWh</span></strong>'
+            source_html = f'<small>{source_label} &middot; {mode_name}</small>'
+            cell_state = " has-production"
+        else:
+            production_html = '<em>No saved query</em>'
+            source_html = ""
+            cell_state = ""
+        history_cells += f"""
+        <div class="calendar-day{cell_state}{is_today}">
+          <span class="day-number">{calendar_day.day}</span>
+          {production_html}
+          {source_html}
+        </div>
+"""
+
+    previous_month = (history_month - timedelta(days=1)).replace(day=1)
+    next_month = (history_month.replace(day=28) + timedelta(days=4)).replace(day=1)
+
+    def history_url(month: date) -> str:
+        params = {
+            "site": site_id,
+            "model": model,
+            "tz": tz,
+            "history_month": month.strftime("%Y-%m"),
+            "rain": "1" if rain_effect else "0",
+        }
+        return "/solar-site?" + urlencode(params)
+
+    history_total = sum(history_values)
+    history_summary = (
+        f"{len(history_values)} saved query days &middot; {history_total:,.1f} kWh total &middot; "
+        f"{history_total / len(history_values):,.1f} kWh/day"
+        if history_values
+        else "No forecast or nowcast query has been saved for this month."
+    )
 
     site_name_json = json.dumps(site_name)
     battery_forecast_json = json.dumps(
@@ -1150,11 +1835,14 @@ def render_solar_site_html(
             "maxChargingAmpere": max(0.0, max_charging_ampere),
             "nominalVoltage": BATTERY_NOMINAL_VOLTAGE,
             "initialSocPercent": min(max(initial_soc_percent, 0.0), 100.0),
+            "stopDischargeSocPercent": min(max(stop_discharge_soc_percent, 0.0), 100.0),
             "consumptionKwhPerHour": max(0.0, consumption_kwh_per_hour),
             "chargeFirst": bool(charge_first),
+            "rainEffect": bool(rain_effect),
             "days": battery_days,
         }
     )
+    hourly_forecast_json = json.dumps({"days": hourly_days})
 
     return f"""<!doctype html>
 <html>
@@ -1228,6 +1916,38 @@ h1 {{
   flex:1 1 260px;
 }}
 
+.mode-control {{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  min-height:37px;
+  margin:0;
+  padding:0 4px;
+  color:#0F172A;
+  font-size:13px;
+}}
+
+.mode-control input {{
+  width:17px;
+  height:17px;
+  accent-color:#0369A1;
+}}
+
+.mode-status {{
+  display:flex;
+  justify-content:space-between;
+  gap:10px;
+  flex-wrap:wrap;
+  margin-top:10px;
+  padding-top:10px;
+  border-top:1px solid #E2E8F0;
+  color:#475569;
+  font-size:12px;
+  font-weight:700;
+}}
+
+.mode-status strong {{ color:#0F172A; }}
+
 label {{
   display:block;
   font-size:12px;
@@ -1274,6 +1994,39 @@ button {{
   margin-bottom:12px;
 }}
 
+.export-actions {{
+  display:flex;
+  align-items:flex-end;
+  justify-content:flex-end;
+  gap:8px;
+  flex-wrap:wrap;
+}}
+
+.card-export-btn {{
+  width:auto;
+  min-height:35px;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  gap:7px;
+  padding:8px 11px;
+  white-space:nowrap;
+}}
+
+.card-export-btn:disabled {{
+  opacity:.6;
+  cursor:wait;
+}}
+
+.jpeg-exporting .card-export-btn {{
+  display:none;
+}}
+
+.export-download-icon {{
+  font-size:16px;
+  line-height:1;
+}}
+
 .export-kicker {{
   font-size:12px;
   font-weight:900;
@@ -1288,11 +2041,27 @@ button {{
   margin-top:2px;
 }}
 
+.today-progress {{
+  display:grid;
+  grid-template-columns:repeat(3, minmax(130px, 1fr)) auto;
+  gap:12px;
+  align-items:center;
+  margin-bottom:14px;
+  padding:10px 0;
+  border-top:1px solid #E2E8F0;
+  border-bottom:1px solid #E2E8F0;
+}}
+
+.today-progress span {{ display:grid; gap:2px; }}
+.today-progress small {{ color:#64748B; font-size:10px; font-weight:800; }}
+.today-progress strong {{ color:#0F172A; font-size:16px; }}
+.today-progress em {{ color:#0369A1; font-size:11px; font-style:normal; font-weight:900; text-align:right; }}
+
 .chart-card {{
   display:grid;
   grid-template-columns:58px minmax(0, 1fr);
   gap:12px;
-  min-height:330px;
+  min-height:350px;
 }}
 
 .y-axis {{
@@ -1343,10 +2112,36 @@ button {{
   position:relative;
   z-index:1;
   display:grid;
-  grid-template-rows:20px minmax(220px, 1fr) 38px;
+  grid-template-rows:20px minmax(220px, 1fr) 58px;
   gap:6px;
   min-width:0;
 }}
+
+.day-bar {{
+  appearance:none;
+  width:auto;
+  padding:0;
+  border:0;
+  border-radius:0;
+  background:transparent;
+  color:inherit;
+  font:inherit;
+  cursor:pointer;
+}}
+
+.day-bar:hover {{ background:#F8FAFC; }}
+
+.day-bar:focus-visible {{
+  outline:2px solid #0284C7;
+  outline-offset:2px;
+}}
+
+.day-bar[aria-pressed="true"] .bar-track {{
+  border-bottom-color:#0284C7;
+  box-shadow:inset 0 -3px 0 #0284C7;
+}}
+
+.day-bar[aria-pressed="true"] .x-label span {{ color:#0369A1; }}
 
 .bar-value {{
   text-align:center;
@@ -1385,6 +2180,15 @@ button {{
   color:#64748B;
 }}
 
+.x-label small {{
+  display:block;
+  margin-top:4px;
+  color:#64748B;
+  font-size:9px;
+  font-weight:700;
+  line-height:1.15;
+}}
+
 .chart-scroll {{
   overflow-x:auto;
   -webkit-overflow-scrolling:touch;
@@ -1411,6 +2215,131 @@ button {{
   width:12px;
   height:12px;
   border-radius:3px;
+}}
+
+.hourly-card {{
+  margin-top:14px;
+  scroll-margin-top:14px;
+}}
+
+.hourly-toolbar {{
+  width:min(240px, 100%);
+}}
+
+.hourly-table-wrap {{
+  overflow-x:auto;
+  -webkit-overflow-scrolling:touch;
+}}
+
+.hourly-table {{
+  width:100%;
+  min-width:850px;
+  border-collapse:collapse;
+  font-size:12px;
+}}
+
+.hourly-table th,
+.hourly-table td {{
+  padding:9px 10px;
+  border-bottom:1px solid #E2E8F0;
+  text-align:left;
+  vertical-align:top;
+}}
+
+.hourly-table th {{
+  color:#475569;
+  font-size:10px;
+  text-transform:uppercase;
+  background:#F8FAFC;
+}}
+
+.hourly-table td:first-child,
+.hourly-table td:nth-child(2) {{
+  color:#0F172A;
+  font-weight:900;
+  white-space:nowrap;
+}}
+
+.hourly-table td:nth-child(3),
+.hourly-table td:nth-child(4),
+.hourly-table td:nth-child(5),
+.hourly-table td:nth-child(6) {{
+  white-space:nowrap;
+}}
+
+.rain-signal {{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  font-weight:800;
+}}
+
+.rain-signal::before {{
+  content:"";
+  width:8px;
+  height:8px;
+  border-radius:50%;
+  background:#94A3B8;
+  flex:0 0 auto;
+}}
+
+.rain-signal[data-level="dry"]::before {{ background:#16A34A; }}
+.rain-signal[data-level="light"]::before {{ background:#EAB308; }}
+.rain-signal[data-level="likely"]::before {{ background:#EA580C; }}
+.rain-signal[data-level="heavy"]::before {{ background:#DC2626; }}
+.rain-signal[data-level="actual"]::before {{ background:#0284C7; }}
+.rain-signal[data-level="off"]::before {{ background:#64748B; }}
+
+.hourly-interpretation {{
+  min-width:250px;
+  color:#475569;
+  line-height:1.35;
+}}
+
+.selection-rules {{
+  margin-top:14px;
+  padding-top:12px;
+  border-top:1px solid #CBD5E1;
+}}
+
+.selection-rules h3 {{
+  margin:0 0 8px;
+  color:#0F172A;
+  font-size:14px;
+}}
+
+.selection-rule {{
+  display:grid;
+  grid-template-columns:10px minmax(110px, .7fr) minmax(210px, 1.3fr) minmax(220px, 1.4fr);
+  gap:8px;
+  align-items:center;
+  padding:7px 0;
+  border-bottom:1px solid #F1F5F9;
+  color:#475569;
+  font-size:11px;
+}}
+
+.selection-rule::before {{
+  content:"";
+  width:8px;
+  height:8px;
+  border-radius:50%;
+  background:#94A3B8;
+}}
+
+.selection-rule[data-level="dry"]::before {{ background:#16A34A; }}
+.selection-rule[data-level="light"]::before {{ background:#EAB308; }}
+.selection-rule[data-level="likely"]::before {{ background:#EA580C; }}
+.selection-rule[data-level="heavy"]::before {{ background:#DC2626; }}
+.selection-rule[data-level="observed"]::before {{ background:#0284C7; }}
+.selection-rule[data-level="actual"]::before {{ background:#0F766E; }}
+.selection-rule strong {{ color:#0F172A; }}
+.selection-rule em {{ color:#334155; font-style:normal; font-weight:800; }}
+
+.selection-rules p {{
+  margin:9px 0 0;
+  color:#64748B;
+  font-size:11px;
 }}
 
 .battery-card {{
@@ -1450,6 +2379,37 @@ button {{
   height:16px;
 }}
 
+.battery-series-controls {{
+  display:flex;
+  align-items:center;
+  justify-content:flex-end;
+  gap:16px;
+  flex-wrap:wrap;
+  margin:2px 0 8px;
+}}
+
+.battery-series-toggle {{
+  display:flex;
+  align-items:center;
+  gap:7px;
+  color:#334155;
+  font-size:12px;
+  font-weight:900;
+  cursor:pointer;
+}}
+
+.battery-series-toggle input {{
+  width:16px;
+  height:16px;
+}}
+
+.battery-series-swatch {{
+  width:18px;
+  height:3px;
+  border-radius:2px;
+  background:var(--series-color);
+}}
+
 .battery-chart-wrap {{
   overflow-x:auto;
   -webkit-overflow-scrolling:touch;
@@ -1482,11 +2442,130 @@ button {{
   cursor:pointer;
 }}
 
+.history-card {{
+  margin-top:14px;
+}}
+
+.history-heading {{
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:12px;
+  flex-wrap:wrap;
+  margin-bottom:12px;
+}}
+
+.month-nav {{
+  display:grid;
+  grid-template-columns:36px minmax(150px, 1fr) 36px;
+  align-items:center;
+  gap:6px;
+}}
+
+.month-nav a {{
+  display:grid;
+  place-items:center;
+  height:34px;
+  border:1px solid #CBD5E1;
+  border-radius:6px;
+  background:#fff;
+  color:#0F172A;
+  text-decoration:none;
+  font-size:20px;
+  line-height:1;
+}}
+
+.month-nav strong {{
+  text-align:center;
+  font-size:14px;
+}}
+
+.calendar-scroll {{
+  overflow-x:auto;
+  -webkit-overflow-scrolling:touch;
+}}
+
+.calendar-grid {{
+  display:grid;
+  grid-template-columns:repeat(7, minmax(94px, 1fr));
+  min-width:700px;
+  border-top:1px solid #CBD5E1;
+  border-left:1px solid #CBD5E1;
+}}
+
+.weekday {{
+  padding:7px 4px;
+  border-right:1px solid #CBD5E1;
+  border-bottom:1px solid #CBD5E1;
+  background:#F1F5F9;
+  color:#475569;
+  text-align:center;
+  font-size:11px;
+  font-weight:900;
+}}
+
+.calendar-day {{
+  position:relative;
+  display:flex;
+  min-height:78px;
+  padding:8px;
+  box-sizing:border-box;
+  flex-direction:column;
+  justify-content:flex-end;
+  gap:4px;
+  border-right:1px solid #CBD5E1;
+  border-bottom:1px solid #CBD5E1;
+  background:#fff;
+}}
+
+.calendar-day.outside {{ background:#F8FAFC; }}
+.calendar-day.has-production {{ background:#ECFDF5; }}
+.calendar-day.today {{ box-shadow:inset 0 0 0 2px #0284C7; }}
+
+.day-number {{
+  position:absolute;
+  top:7px;
+  right:8px;
+  color:#475569;
+  font-size:11px;
+  font-weight:900;
+}}
+
+.calendar-day strong {{
+  color:#065F46;
+  font-size:15px;
+}}
+
+.calendar-day strong span {{ font-size:9px; }}
+
+.calendar-day em {{
+  color:#94A3B8;
+  font-size:10px;
+  font-style:normal;
+}}
+
+.calendar-day small {{
+  color:#475569;
+  font-size:9px;
+  line-height:1.15;
+}}
+
+.history-summary {{
+  margin:10px 0 12px;
+  color:#475569;
+  font-size:12px;
+  font-weight:800;
+}}
+
 @media (max-width: 760px) {{
   .page {{ padding:12px; }}
   .chart-card {{ grid-template-columns:52px minmax(0, 1fr); }}
   .chart-body {{ min-width:560px; gap:9px; }}
   .battery-controls {{ grid-template-columns:1fr; }}
+  .today-progress {{ grid-template-columns:1fr 1fr; }}
+  .today-progress em {{ text-align:left; }}
+  .selection-rule {{ grid-template-columns:10px 1fr; align-items:start; }}
+  .selection-rule::before {{ grid-row:1 / span 3; margin-top:3px; }}
 }}
 
 @media (max-width: 460px) {{
@@ -1513,21 +2592,35 @@ button {{
         </select>
       </div>
       <input type="hidden" name="model" value="{html_lib.escape(model)}" />
+      <input type="hidden" name="tz" value="{html_lib.escape(tz)}" />
+      <input type="hidden" name="history_month" value="{history_month.strftime('%Y-%m')}" />
+      <input type="hidden" name="rain" value="0" />
+      <label class="mode-control" for="rainEffect">
+        <input id="rainEffect" name="rain" type="checkbox" value="1"{' checked' if rain_effect else ''} onchange="this.form.submit()" />
+        Include rain effect
+      </label>
       <div>
         <button type="submit">Show Site</button>
       </div>
     </form>
+    <div class="mode-status">
+      <span>Prediction: <strong>{mode_name}</strong></span>
+      <span>{method_note}</span>
+      <span>{calibration_note}</span>
+      {inverter_status_html}
+    </div>
   </section>
 
   <section class="forecast-export" id="solarSiteCapture">
     <div class="export-heading">
       <div>
-        <div class="export-kicker">Solar Production Forecast</div>
+        <div class="export-kicker">Solar Production Forecast &middot; {mode_name}</div>
         <div class="export-title">{safe_name}</div>
       </div>
     </div>
+    {today_progress_html}
 
-    <div class="chart-scroll" role="img" aria-label="Estimated solar production by date">
+    <div class="chart-scroll" role="group" aria-label="Select a day to view its hourly solar forecast">
       <div class="chart-card">
         <div class="y-axis" aria-hidden="true">
           {y_axis_html}
@@ -1549,12 +2642,73 @@ button {{
     </div>
   </section>
 
+  <section class="forecast-export hourly-card" id="hourlyForecastCard">
+    <div class="export-heading">
+      <div>
+        <div class="export-kicker">Hourly Prediction &amp; Interpretation</div>
+        <div class="export-title">{safe_name}</div>
+      </div>
+      <div class="export-actions">
+        <div class="hourly-toolbar">
+          <label for="hourlyDate">Forecast Date</label>
+          <select id="hourlyDate"></select>
+        </div>
+        <button type="button" class="card-export-btn" id="hourlyDownloadBtn" title="Save hourly prediction as JPEG">
+          <span class="export-download-icon" aria-hidden="true">&#8595;</span>
+          Save JPEG
+        </button>
+      </div>
+    </div>
+    <div class="hourly-table-wrap">
+      <table class="hourly-table">
+        <thead>
+          <tr>
+            <th>Hour</th>
+            <th>Expected</th>
+            <th>Model range</th>
+            <th>Rain</th>
+            <th>Extra rain effect</th>
+            <th>Model used</th>
+            <th>Interpretation</th>
+          </tr>
+        </thead>
+        <tbody id="hourlyRows"></tbody>
+      </table>
+    </div>
+    <div class="selection-rules" aria-labelledby="selectionRulesTitle">
+      <h3 id="selectionRulesTitle">Conditions Used For Model Selection</h3>
+      <div class="selection-rule" data-level="dry">
+        <strong>Dry</strong><span>Below 30% rain probability or below 0.05 mm</span><em>Middle raw solar model; no rain penalty</em>
+      </div>
+      <div class="selection-rule" data-level="light">
+        <strong>Light or uncertain</strong><span>Meaningful rain below the likely threshold</span><em>Middle rain-adjusted model</em>
+      </div>
+      <div class="selection-rule" data-level="likely">
+        <strong>Likely rain</strong><span>At least 60% probability and 0.3 mm</span><em>Lower-middle rain-adjusted model</em>
+      </div>
+      <div class="selection-rule" data-level="heavy">
+        <strong>Heavy rain</strong><span>At least 80% probability and 1.0 mm</span><em>Lowest rain-adjusted model</em>
+      </div>
+      <div class="selection-rule" data-level="observed">
+        <strong>Satellite nowcast</strong><span>Completed hour with satellite sunlight data</span><em>Hourly rain penalty is still applied</em>
+      </div>
+      <div class="selection-rule" data-level="actual">
+        <strong>Inverter actual</strong><span>Workbook contains readings for the hour</span><em>Measured kWh replaces forecast for the covered time</em>
+      </div>
+      <p>Rain conditions use the middle probability and rainfall amount reported by the available weather models for that hour.</p>
+    </div>
+  </section>
+
   <section class="forecast-export battery-card" id="batteryForecastCard">
     <div class="export-heading">
       <div>
         <div class="export-kicker">Battery Charging Forecast</div>
         <div class="export-title">{safe_name}</div>
       </div>
+      <button type="button" class="card-export-btn" id="batteryDownloadBtn" title="Save battery charging forecast as JPEG">
+        <span class="export-download-icon" aria-hidden="true">&#8595;</span>
+        Save JPEG
+      </button>
     </div>
 
     <div class="battery-controls">
@@ -1576,48 +2730,229 @@ button {{
       </label>
     </div>
 
+    <div class="battery-series-controls" aria-label="Battery chart plots">
+      <label class="battery-series-toggle" for="showSolarPlot">
+        <input id="showSolarPlot" type="checkbox" checked />
+        <span class="battery-series-swatch" style="--series-color:#2563EB" aria-hidden="true"></span>
+        Forecasted solar
+      </label>
+      <label class="battery-series-toggle" for="showConsumptionPlot">
+        <input id="showConsumptionPlot" type="checkbox" checked />
+        <span class="battery-series-swatch" style="--series-color:#DC2626" aria-hidden="true"></span>
+        Approx. consumption
+      </label>
+    </div>
+
     <div class="battery-chart-wrap">
-      <svg class="battery-chart" id="batterySocChart" viewBox="0 0 720 280" role="img" aria-label="Forecasted battery state of charge from 6am to 6pm"></svg>
+      <svg class="battery-chart" id="batterySocChart" viewBox="0 0 720 280" role="img" aria-label="Forecasted battery state of charge, hourly solar production, and approximate consumption from 6am to 6pm"></svg>
     </div>
     <div class="battery-summary">
       <span>Forecasted SOC: <strong id="batteryEndSoc">0%</strong></span>
       <span>Capacity: <strong>{max(0.0, battery_capacity_ah):,.0f} Ah</strong></span>
       <span>Max charge: <strong>{max(0.0, max_charging_ampere):,.0f} A</strong></span>
+      <span>Stop discharge: <strong>{min(max(stop_discharge_soc_percent, 0.0), 100.0):.0f}%</strong></span>
+      <span>Source: <strong>{mode_name} hourly</strong></span>
     </div>
+  </section>
+
+  <section class="forecast-export history-card" id="productionHistoryCard">
+    <div class="history-heading">
+      <div>
+        <div class="export-kicker">Forecast &amp; Nowcast History</div>
+        <div class="export-title">{safe_name}</div>
+      </div>
+      <div class="export-actions">
+        <nav class="month-nav" aria-label="Production history month">
+          <a href="{html_lib.escape(history_url(previous_month))}" aria-label="Previous month" title="Previous month">&#8249;</a>
+          <strong>{history_month.strftime('%B %Y')}</strong>
+          <a href="{html_lib.escape(history_url(next_month))}" aria-label="Next month" title="Next month">&#8250;</a>
+        </nav>
+        <button type="button" class="card-export-btn" id="historyDownloadBtn" title="Save forecast and nowcast history as JPEG">
+          <span class="export-download-icon" aria-hidden="true">&#8595;</span>
+          Save JPEG
+        </button>
+      </div>
+    </div>
+    <div class="calendar-scroll">
+      <div class="calendar-grid">
+        <div class="weekday">Mon</div><div class="weekday">Tue</div><div class="weekday">Wed</div>
+        <div class="weekday">Thu</div><div class="weekday">Fri</div><div class="weekday">Sat</div>
+        <div class="weekday">Sun</div>
+        {history_cells}
+      </div>
+    </div>
+    <div class="history-summary">{history_summary}</div>
   </section>
 </main>
 <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
 <script>
-document.getElementById("siteDownloadBtn").addEventListener("click", function (e) {{
-  e.preventDefault();
-
-  const target = document.getElementById("solarSiteCapture");
-  const siteName = {site_name_json};
-
-  html2canvas(target, {{
-    backgroundColor: "#ffffff",
-    scale: 2,
-    useCORS: true,
-    width: target.scrollWidth,
-    windowWidth: target.scrollWidth
-  }}).then(canvas => {{
-    const link = document.createElement("a");
-    const d = new Date().toISOString().slice(0,10);
-    const safeName = siteName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || "solar-site";
-
-    link.download = `${{safeName}}-solar-forecast-${{d}}.jpg`;
-    link.href = canvas.toDataURL("image/jpeg", 0.95);
-    link.click();
-  }});
-}});
-
+const siteName = {site_name_json};
 const batteryForecast = {battery_forecast_json};
+const hourlyForecast = {hourly_forecast_json};
 const batteryDate = document.getElementById("batteryDate");
 const initialSoc = document.getElementById("initialSoc");
 const consumptionKwh = document.getElementById("consumptionKwh");
 const chargeFirst = document.getElementById("chargeFirst");
+const showSolarPlot = document.getElementById("showSolarPlot");
+const showConsumptionPlot = document.getElementById("showConsumptionPlot");
 const batteryChart = document.getElementById("batterySocChart");
 const batteryEndSoc = document.getElementById("batteryEndSoc");
+const hourlyDate = document.getElementById("hourlyDate");
+const hourlyRows = document.getElementById("hourlyRows");
+const hourlyCard = document.getElementById("hourlyForecastCard");
+const dayBars = Array.from(document.querySelectorAll(".day-bar"));
+
+function safeFilePart(value, fallback) {{
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)/g, "") || fallback;
+}}
+
+function downloadSectionAsJpeg(targetId, filenamePart, trigger = null) {{
+  const target = document.getElementById(targetId);
+  if (!target || typeof html2canvas !== "function") return;
+
+  const scrollRegions = Array.from(target.querySelectorAll(
+    ".hourly-table-wrap, .battery-chart-wrap, .calendar-scroll"
+  ));
+  const originalStyles = scrollRegions.map(region => ({{
+    region,
+    overflow: region.style.overflow,
+    width: region.style.width
+  }}));
+  scrollRegions.forEach(region => {{
+    const fullWidth = region.scrollWidth;
+    region.style.overflow = "visible";
+    region.style.width = `${{fullWidth}}px`;
+  }});
+  target.classList.add("jpeg-exporting");
+  if (trigger) {{
+    trigger.disabled = true;
+    trigger.setAttribute("aria-busy", "true");
+  }}
+
+  requestAnimationFrame(() => {{
+    const captureWidth = Math.max(target.scrollWidth, target.offsetWidth);
+    html2canvas(target, {{
+      backgroundColor: "#ffffff",
+      scale: 2,
+      useCORS: true,
+      width: captureWidth,
+      windowWidth: captureWidth,
+      height: target.scrollHeight,
+      windowHeight: target.scrollHeight
+    }}).then(canvas => {{
+      const link = document.createElement("a");
+      const safeName = safeFilePart(siteName, "solar-site");
+      link.download = `${{safeName}}-${{filenamePart}}.jpg`;
+      link.href = canvas.toDataURL("image/jpeg", 0.95);
+      link.click();
+    }}).catch(error => {{
+      console.error("JPEG export failed", error);
+      window.alert("The JPEG could not be saved. Please try again.");
+    }}).finally(() => {{
+      originalStyles.forEach(({{ region, overflow, width }}) => {{
+        region.style.overflow = overflow;
+        region.style.width = width;
+      }});
+      target.classList.remove("jpeg-exporting");
+      if (trigger) {{
+        trigger.disabled = false;
+        trigger.removeAttribute("aria-busy");
+      }}
+    }});
+  }});
+}}
+
+document.getElementById("siteDownloadBtn").addEventListener("click", function (e) {{
+  e.preventDefault();
+  const d = new Date().toISOString().slice(0, 10);
+  downloadSectionAsJpeg("solarSiteCapture", `solar-forecast-${{d}}`, this);
+}});
+
+document.getElementById("hourlyDownloadBtn").addEventListener("click", function () {{
+  const day = hourlyForecast.days?.[Number(hourlyDate.value) || 0];
+  const datePart = safeFilePart(day?.date, "selected-date");
+  downloadSectionAsJpeg("hourlyForecastCard", `hourly-prediction-${{datePart}}`, this);
+}});
+
+document.getElementById("batteryDownloadBtn").addEventListener("click", function () {{
+  const day = batteryForecast.days?.[Number(batteryDate.value) || 0];
+  const datePart = safeFilePart(day?.date, "selected-date");
+  downloadSectionAsJpeg("batteryForecastCard", `battery-charging-${{datePart}}`, this);
+}});
+
+document.getElementById("historyDownloadBtn").addEventListener("click", function () {{
+  downloadSectionAsJpeg(
+    "productionHistoryCard",
+    "forecast-nowcast-history-{history_month.strftime('%Y-%m')}",
+    this
+  );
+}});
+
+function renderHourlyForecast() {{
+  const selectedIndex = Number(hourlyDate.value) || 0;
+  const day = (hourlyForecast.days || [])[selectedIndex];
+  hourlyRows.innerHTML = "";
+  dayBars.forEach((bar, index) => {{
+    bar.setAttribute("aria-pressed", index === selectedIndex ? "true" : "false");
+  }});
+  if (!day) return;
+
+  (day.rows || []).forEach((row) => {{
+    const tr = document.createElement("tr");
+    const rainText = `${{Math.round(row.rainProbability)}}% / ${{Number(row.rainMm).toFixed(1)}} mm`;
+    const effectText = row.effectLabel || (row.rainPenaltyPercent > 0
+        ? `-${{Math.round(row.rainPenaltyPercent)}}%`
+        : row.rainLevel === "dry" || row.rainLevel === "off"
+          ? "None"
+          : "No extra penalty");
+    const values = [
+      row.time,
+      `${{Number(row.expectedKwh).toFixed(1)}} kWh`,
+      `${{Number(row.conservativeKwh).toFixed(1)}}-${{Number(row.upperKwh).toFixed(1)}} kWh`,
+      rainText,
+      effectText,
+      row.model,
+      row.interpretation
+    ];
+    values.forEach((value, index) => {{
+      const td = document.createElement("td");
+      td.textContent = value;
+      if (index === 3) {{
+        td.className = "rain-signal";
+        td.dataset.level = row.rainLevel;
+      }} else if (index === 6) {{
+        td.className = "hourly-interpretation";
+      }}
+      tr.appendChild(td);
+    }});
+    hourlyRows.appendChild(tr);
+  }});
+}}
+
+function selectHourlyDay(index, shouldScroll = false) {{
+  const dayCount = (hourlyForecast.days || []).length;
+  if (!dayCount) return;
+  const selectedIndex = Math.min(Math.max(Number(index) || 0, 0), dayCount - 1);
+  hourlyDate.value = String(selectedIndex);
+  renderHourlyForecast();
+  if (shouldScroll) {{
+    hourlyCard.scrollIntoView({{ behavior: "smooth", block: "start" }});
+  }}
+}}
+
+function initHourlyDates() {{
+  hourlyDate.innerHTML = "";
+  (hourlyForecast.days || []).forEach((day, index) => {{
+    const option = document.createElement("option");
+    option.value = String(index);
+    option.textContent = day.label;
+    hourlyDate.appendChild(option);
+  }});
+  selectHourlyDay(0);
+}}
 
 function clampNumber(value, min, max) {{
   const n = Number(value);
@@ -1651,6 +2986,8 @@ function estimateSoc(day) {{
   const points = day?.points || [];
   const maxChargeKwh = Math.max(Number(batteryForecast.maxChargingAmpere) || 0, 0)
     * Math.max(Number(batteryForecast.nominalVoltage) || 0, 0) / 1000;
+  const stopDischargePct = clampNumber(batteryForecast.stopDischargeSocPercent, 0, 100);
+  const reserveKwh = capacity * (stopDischargePct / 100);
   let socKwh = capacity * (initialPct / 100);
 
   return points.map((point, index) => {{
@@ -1667,15 +3004,30 @@ function estimateSoc(day) {{
       }};
     }}
 
-    const interval = points[index - 1];
+    const interval = point;
     const production = Math.max(Number(interval.productionKwh) || 0, 0);
-    const chargeableSolarKwh = shouldChargeFirst ? production : Math.max(production - consumptionPerHour, 0);
+    const availableCapacityKwh = Math.max(capacity - socKwh, 0);
     const netSolarKwh = production - consumptionPerHour;
-    const chargeKwh = chargeableSolarKwh > 0 && maxChargeKwh > 0 ? Math.min(chargeableSolarKwh, maxChargeKwh) : 0;
-    const unmetLoadKwh = netSolarKwh < 0 ? Math.abs(netSolarKwh) : 0;
-    socKwh = Math.min(Math.max(socKwh + chargeKwh, 0), capacity || 0);
+    let solarForLoadKwh = shouldChargeFirst ? 0 : Math.min(production, consumptionPerHour);
+    const chargeableSolarKwh = shouldChargeFirst
+      ? production
+      : Math.max(production - solarForLoadKwh, 0);
+    const chargeKwh = chargeableSolarKwh > 0 && maxChargeKwh > 0
+      ? Math.min(chargeableSolarKwh, maxChargeKwh, availableCapacityKwh)
+      : 0;
+    if (shouldChargeFirst) {{
+      solarForLoadKwh = Math.min(Math.max(production - chargeKwh, 0), consumptionPerHour);
+    }}
+    const loadShortfallKwh = Math.max(consumptionPerHour - solarForLoadKwh, 0);
+    const dischargeableKwh = Math.max(socKwh - reserveKwh, 0);
+    const blockBatteryDischarge = shouldChargeFirst && chargeKwh > 0;
+    const dischargeKwh = blockBatteryDischarge
+      ? 0
+      : Math.min(loadShortfallKwh, dischargeableKwh);
+    const unmetLoadKwh = Math.max(loadShortfallKwh - dischargeKwh, 0);
+    socKwh = Math.min(Math.max(socKwh + chargeKwh - dischargeKwh, 0), capacity || 0);
     const socPct = capacity > 0 ? (socKwh / capacity) * 100 : 0;
-    return {{ ...point, socPct, chargeKwh, unmetLoadKwh, loadKwh: consumptionPerHour, netSolarKwh }};
+    return {{ ...point, socPct, chargeKwh, dischargeKwh, unmetLoadKwh, loadKwh: consumptionPerHour, netSolarKwh }};
   }});
 }}
 
@@ -1687,8 +3039,8 @@ function renderBatteryChart() {{
   const width = 720;
   const height = 280;
   const left = 48;
-  const right = 16;
-  const top = 18;
+  const right = 52;
+  const top = 34;
   const bottom = 42;
   const plotW = width - left - right;
   const plotH = height - top - bottom;
@@ -1705,8 +3057,19 @@ function renderBatteryChart() {{
     }}, `${{tick}}%`));
   }});
 
+  const stopDischargePct = clampNumber(batteryForecast.stopDischargeSocPercent, 0, 100);
+  const reserveY = top + plotH - (stopDischargePct / 100) * plotH;
+  batteryChart.appendChild(svgEl("line", {{
+    x1: left, y1: reserveY, x2: width - right, y2: reserveY,
+    stroke: "#DC2626", "stroke-width": "2", "stroke-dasharray": "7 5"
+  }}));
   batteryChart.appendChild(svgEl("text", {{
-    x: left - 8, y: top - 4, "text-anchor": "end",
+    x: width - right, y: Math.max(top + 11, reserveY - 5), "text-anchor": "end",
+    "font-size": "11", "font-weight": "900", fill: "#B91C1C"
+  }}, `Stop ${{Math.round(stopDischargePct)}}%`));
+
+  batteryChart.appendChild(svgEl("text", {{
+    x: left - 8, y: 15, "text-anchor": "end",
     "font-size": "12", "font-weight": "900", fill: "#334155"
   }}, "SOC"));
 
@@ -1725,6 +3088,71 @@ function renderBatteryChart() {{
     return {{ x, y, point, index }};
   }});
 
+  const hourlyPoints = points.filter(point => !point.isInitial);
+  const energyValues = hourlyPoints.flatMap(point => [
+    Math.max(Number(point.productionKwh) || 0, 0),
+    Math.max(Number(point.loadKwh) || 0, 0)
+  ]);
+  const largestEnergyValue = Math.max(...energyValues, 1);
+  const energyMagnitude = 10 ** Math.floor(Math.log10(largestEnergyValue));
+  const normalizedEnergy = largestEnergyValue / energyMagnitude;
+  const niceEnergyFactor = normalizedEnergy <= 1
+    ? 1
+    : normalizedEnergy <= 2
+      ? 2
+      : normalizedEnergy <= 5
+        ? 5
+        : 10;
+  const energyMax = niceEnergyFactor * energyMagnitude;
+  const showEnergyAxis = showSolarPlot.checked || showConsumptionPlot.checked;
+
+  if (showEnergyAxis) {{
+    [0, 25, 50, 75, 100].forEach(tick => {{
+      const y = top + plotH - (tick / 100) * plotH;
+      const value = (tick / 100) * energyMax;
+      batteryChart.appendChild(svgEl("text", {{
+        x: width - right + 8, y: y + 4, "text-anchor": "start",
+        "font-size": "11", "font-weight": "800", fill: "#475569"
+      }}, Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1)));
+    }});
+    batteryChart.appendChild(svgEl("text", {{
+      x: width - right + 8, y: 15, "text-anchor": "start",
+      "font-size": "12", "font-weight": "900", fill: "#334155"
+    }}, "kWh"));
+  }}
+
+  function drawHourlyEnergySeries(valueKey, color) {{
+    if (!hourlyPoints.length) return;
+    const intervals = hourlyPoints.map((point, index) => {{
+      const value = Math.max(Number(point[valueKey]) || 0, 0);
+      return {{
+        point,
+        value,
+        startX: left + (index / hourlyPoints.length) * plotW,
+        endX: left + ((index + 1) / hourlyPoints.length) * plotW,
+        y: top + plotH - (value / energyMax) * plotH
+      }};
+    }});
+    const pathParts = [`M ${{intervals[0].startX.toFixed(2)}} ${{intervals[0].y.toFixed(2)}}`];
+    intervals.forEach((interval, index) => {{
+      pathParts.push(`L ${{interval.endX.toFixed(2)}} ${{interval.y.toFixed(2)}}`);
+      if (index < intervals.length - 1) {{
+        pathParts.push(`L ${{interval.endX.toFixed(2)}} ${{intervals[index + 1].y.toFixed(2)}}`);
+      }}
+    }});
+    batteryChart.appendChild(svgEl("path", {{
+      d: pathParts.join(" "), fill: "none", stroke: color, "stroke-width": "3",
+      "stroke-linecap": "round", "stroke-linejoin": "round"
+    }}));
+  }}
+
+  if (showSolarPlot.checked) {{
+    drawHourlyEnergySeries("productionKwh", "#2563EB");
+  }}
+  if (showConsumptionPlot.checked) {{
+    drawHourlyEnergySeries("loadKwh", "#DC2626");
+  }}
+
   batteryChart.appendChild(svgEl("polyline", {{
     points: coords.map(p => `${{p.x.toFixed(2)}},${{p.y.toFixed(2)}}`).join(" "),
     fill: "none", stroke: "#F97316", "stroke-width": "4",
@@ -1740,7 +3168,7 @@ function renderBatteryChart() {{
       {{}},
       point.isInitial
         ? `${{point.time}}: initial ${{Math.round(point.socPct)}}% SOC`
-        : `${{point.time}}: ${{Math.round(point.socPct)}}% SOC | solar ${{point.productionKwh.toFixed(2)}} kWh | load ${{point.loadKwh.toFixed(2)}} kWh | charge ${{point.chargeKwh.toFixed(2)}} kWh | unmet load ${{point.unmetLoadKwh.toFixed(2)}} kWh`
+        : `${{point.time}}: ${{Math.round(point.socPct)}}% SOC | solar ${{point.productionKwh.toFixed(2)}} kWh | load ${{point.loadKwh.toFixed(2)}} kWh | charge ${{point.chargeKwh.toFixed(2)}} kWh | discharge ${{point.dischargeKwh.toFixed(2)}} kWh | unmet load ${{point.unmetLoadKwh.toFixed(2)}} kWh`
     ));
     batteryChart.appendChild(marker);
     batteryChart.appendChild(svgEl("text", {{
@@ -1760,8 +3188,13 @@ function renderBatteryChart() {{
 }}
 
 initBatteryDates();
-[batteryDate, initialSoc, consumptionKwh, chargeFirst].forEach(el => el.addEventListener("input", renderBatteryChart));
-[batteryDate, initialSoc, consumptionKwh, chargeFirst].forEach(el => el.addEventListener("change", renderBatteryChart));
+initHourlyDates();
+[batteryDate, initialSoc, consumptionKwh, chargeFirst, showSolarPlot, showConsumptionPlot].forEach(el => el.addEventListener("input", renderBatteryChart));
+[batteryDate, initialSoc, consumptionKwh, chargeFirst, showSolarPlot, showConsumptionPlot].forEach(el => el.addEventListener("change", renderBatteryChart));
+hourlyDate.addEventListener("change", () => selectHourlyDay(hourlyDate.value));
+dayBars.forEach((bar, index) => {{
+  bar.addEventListener("click", () => selectHourlyDay(index, true));
+}});
 renderBatteryChart();
 </script>
 </body>
@@ -1868,7 +3301,10 @@ def index():
     seen_hours = set()
 
     for p in places:
-        hourly = client.hourly_forecast(p.lat, p.lon, tz, model)
+        if view == "solar":
+            hourly = client.hybrid_solar_forecast(p.lat, p.lon, tz, model)
+        else:
+            hourly = client.hourly_forecast(p.lat, p.lon, tz, model)
         cells: Dict[str, Tuple[str, float, int, float]] = {}
 
         for t, pr, pop, cc, solar in zip(
@@ -1930,6 +3366,17 @@ def solar_site_page():
     tz = request.args.get("tz", DEFAULT_TZ)
     model = request.args.get("model", DEFAULT_MODEL)
     selected_site_id = (request.args.get("site") or "").strip()
+    rain_values = request.args.getlist("rain")
+    rain_effect = "1" in rain_values if rain_values else True
+    today = safe_now_date_in_tz(tz)
+
+    history_month_raw = (request.args.get("history_month") or "").strip()
+    try:
+        history_month = datetime.strptime(history_month_raw, "%Y-%m").date().replace(day=1)
+        if not (2000 <= history_month.year <= today.year + 1):
+            history_month = today.replace(day=1)
+    except ValueError:
+        history_month = today.replace(day=1)
 
     try:
         sites = read_sites_file(DEFAULT_PLACES_FILE)
@@ -1970,6 +3417,10 @@ def solar_site_page():
         selected_site.get("initial_soc_percent", selected_site.get("initial_soc")) if selected_site else None,
         20.0,
     )
+    default_stop_discharge_soc_percent = _to_float(
+        selected_site.get("stop_discharge_soc_percent", selected_site.get("stop_discharge_soc")) if selected_site else None,
+        20.0,
+    )
     default_consumption_kwh_per_hour = _to_float(
         selected_site.get("consumption_kwh_per_hour", selected_site.get("hourly_consumption_kwh")) if selected_site else None,
         0.0,
@@ -1984,8 +3435,28 @@ def solar_site_page():
     battery_capacity_ah = max(0.0, default_battery_capacity_ah)
     max_charging_ampere = max(0.0, default_max_charging_ampere)
     initial_soc_percent = min(max(default_initial_soc_percent, 0.0), 100.0)
+    stop_discharge_soc_percent = min(max(default_stop_discharge_soc_percent, 0.0), 100.0)
     consumption_kwh_per_hour = max(0.0, default_consumption_kwh_per_hour)
     charge_first = default_charge_first
+    inverter_data_file = str(selected_site.get("inverter_data_file") or "").strip() if selected_site else ""
+    if inverter_data_file and not os.path.isabs(inverter_data_file):
+        inverter_data_file = os.path.join(
+            os.path.dirname(os.path.abspath(DEFAULT_PLACES_FILE)),
+            inverter_data_file,
+        )
+    try:
+        inverter_data = inverter_actuals_for_file(inverter_data_file)
+    except Exception:
+        inverter_data = {"hourly": {}, "daily": {}, "last_reading": None, "source": ""}
+    inverter_hourly = inverter_data.get("hourly") or {}
+    inverter_daily = inverter_data.get("daily") or {}
+    inverter_last_reading = inverter_data.get("last_reading")
+    inverter_note = ""
+    if isinstance(inverter_last_reading, datetime):
+        inverter_note = (
+            f"Inverter feed: {inverter_data.get('source') or 'workbook'} through "
+            f"{inverter_last_reading.strftime('%b %d, %I:%M %p').replace(' 0', ' ')}"
+        )
 
     if selected_site is None and selected_site_id:
         selected_site_id = ""
@@ -1996,38 +3467,290 @@ def solar_site_page():
         return Response("Invalid longitude. Use a value from -180 to 180.", status=400, mimetype="text/plain")
 
     try:
-        hourly = OpenMeteoClient().hourly_forecast(lat, lon, tz, model)
+        weather_client = OpenMeteoClient()
+        hourly = weather_client.hybrid_solar_forecast(lat, lon, tz, model)
+        hourly = weather_client.add_rain_model_scenarios(hourly, lat, lon, tz, model)
     except Exception as e:
         return Response(f"Error fetching forecast: {e}", status=502, mimetype="text/plain")
 
-    by_day: Dict[date, float] = {}
-    for t, solar in zip(hourly["time"], hourly["solar"]):
-        by_day[t.date()] = by_day.get(t.date(), 0.0) + max(0.0, _to_float(solar))
+    base_calibration_factor, base_calibration_days = solar_calibration_factor(
+        selected_site_id,
+        False,
+        today,
+    )
+    rain_calibration_factor, rain_calibration_days = solar_calibration_factor(
+        selected_site_id,
+        True,
+        today,
+    )
+    calibration_factor = rain_calibration_factor if rain_effect else base_calibration_factor
+    calibration_days = rain_calibration_days if rain_effect else base_calibration_days
+
+    by_day: Dict[date, Dict[str, float]] = {}
+    hourly_production: List[Tuple[datetime, float, float, float]] = []
+    hourly_detail_rows: List[Dict[str, object]] = []
+    solar_sources = hourly.get("solar_source") or ["forecast"] * len(hourly["time"])
+    rain_solar_values = hourly.get("rain_solar") or hourly["solar"]
+    conservative_solar_values = hourly.get("rain_conservative_solar") or rain_solar_values
+    upper_solar_values = hourly.get("rain_upper_solar") or rain_solar_values
+    consensus_values = hourly.get("rain_consensus_used") or [False] * len(hourly["time"])
+    adjustment_precip_values = hourly.get("rain_adjustment_precip") or hourly["precip"]
+    adjustment_pop_values = hourly.get("rain_adjustment_pop") or hourly["pop"]
+    selected_model_values = hourly.get("rain_selected_model") or ["Primary forecast"] * len(hourly["time"])
+    interpretation_values = hourly.get("rain_interpretation") or ["Primary solar forecast used."] * len(hourly["time"])
+    rain_level_values = hourly.get("rain_level") or ["dry"] * len(hourly["time"])
+    retained_factor_values = hourly.get("rain_retained_factor") or [1.0] * len(hourly["time"])
+    rain_model_count = max(1, int(_to_float(hourly.get("rain_model_count"), 1.0)))
+    completed_hour = safe_now_in_tz(tz).replace(minute=0, second=0, microsecond=0)
+    has_today_inverter_feed = today in inverter_daily
+    for t, solar, rain_solar, conservative_solar, upper_solar, precipitation, probability, adjustment_precipitation, adjustment_probability, selected_model, interpretation, rain_level, retained_factor, solar_source, consensus_used in zip(
+        hourly["time"],
+        hourly["solar"],
+        rain_solar_values,
+        conservative_solar_values,
+        upper_solar_values,
+        hourly["precip"],
+        hourly["pop"],
+        adjustment_precip_values,
+        adjustment_pop_values,
+        selected_model_values,
+        interpretation_values,
+        rain_level_values,
+        retained_factor_values,
+        solar_sources,
+        consensus_values,
+    ):
+        base_kwh = hourly_solar_production_kwh(
+            system_kw,
+            _to_float(solar),
+            efficiency_factor,
+        )
+        rain_kwh = hourly_solar_production_kwh(
+            system_kw,
+            _to_float(rain_solar),
+            efficiency_factor,
+        )
+        conservative_kwh = hourly_solar_production_kwh(
+            system_kw,
+            _to_float(conservative_solar),
+            efficiency_factor,
+        )
+        upper_kwh = hourly_solar_production_kwh(
+            system_kw,
+            _to_float(upper_solar),
+            efficiency_factor,
+        )
+        hour_key = t.replace(minute=0, second=0, microsecond=0)
+        actual_record = inverter_hourly.get(hour_key) if t <= completed_hour else None
+        actual_kwh = max(0.0, _to_float(actual_record.get("kwh"))) if actual_record else 0.0
+        actual_fraction = (
+            min(max(_to_float(actual_record.get("coverage_minutes")) / 60.0, 0.0), 1.0)
+            if actual_record
+            else 0.0
+        )
+        forecast_fraction = 1.0 - actual_fraction
+        base_hybrid_display_kwh = actual_kwh + (
+            base_kwh * base_calibration_factor * forecast_fraction
+        )
+        rain_hybrid_display_kwh = actual_kwh + (
+            rain_kwh * rain_calibration_factor * forecast_fraction
+        )
+        conservative_hybrid_display_kwh = actual_kwh + (
+            conservative_kwh * rain_calibration_factor * forecast_fraction
+        )
+        upper_hybrid_display_kwh = actual_kwh + (
+            upper_kwh * rain_calibration_factor * forecast_fraction
+        )
+        day_totals = by_day.setdefault(
+            t.date(),
+            {
+                "irradiation_wh_m2": 0.0,
+                "base_forecast_kwh": 0.0,
+                "rain_forecast_kwh": 0.0,
+                "rain_conservative_kwh": 0.0,
+                "rain_upper_kwh": 0.0,
+                "precipitation_mm": 0.0,
+                "rain_hours": 0.0,
+                "has_nowcast": 0.0,
+                "consensus_hours": 0.0,
+                "estimated_by_now_kwh": 0.0,
+                "base_hybrid_display_kwh": 0.0,
+                "rain_hybrid_display_kwh": 0.0,
+                "conservative_hybrid_display_kwh": 0.0,
+                "upper_hybrid_display_kwh": 0.0,
+                "inverter_actual_kwh": 0.0,
+                "has_inverter_actual": 0.0,
+                "rain_model_count": float(rain_model_count),
+            },
+        )
+        day_totals["irradiation_wh_m2"] += max(0.0, _to_float(solar))
+        day_totals["base_forecast_kwh"] += base_kwh
+        day_totals["rain_forecast_kwh"] += rain_kwh
+        day_totals["rain_conservative_kwh"] += conservative_kwh
+        day_totals["rain_upper_kwh"] += upper_kwh
+        day_totals["base_hybrid_display_kwh"] += base_hybrid_display_kwh
+        day_totals["rain_hybrid_display_kwh"] += rain_hybrid_display_kwh
+        day_totals["conservative_hybrid_display_kwh"] += conservative_hybrid_display_kwh
+        day_totals["upper_hybrid_display_kwh"] += upper_hybrid_display_kwh
+        day_totals["inverter_actual_kwh"] += actual_kwh
+        if actual_fraction > 0:
+            day_totals["has_inverter_actual"] = 1.0
+        day_totals["precipitation_mm"] += max(0.0, _to_float(precipitation))
+        if _to_float(precipitation) > 0 or _to_float(probability) >= 50:
+            day_totals["rain_hours"] += 1
+        if solar_source == "nowcast":
+            day_totals["has_nowcast"] = 1.0
+        if consensus_used:
+            day_totals["consensus_hours"] += 1
+
+        selected_display_kwh = (
+            rain_hybrid_display_kwh if rain_effect else base_hybrid_display_kwh
+        )
+        if t.date() == today and t <= completed_hour:
+            day_totals["estimated_by_now_kwh"] += (
+                actual_kwh if has_today_inverter_feed else selected_display_kwh
+            )
+        hourly_production.append((t, selected_display_kwh, base_kwh, rain_kwh))
+        actual_source = actual_fraction > 0
+        actual_full_hour = actual_fraction >= 0.98
+        if actual_source:
+            detail_model = (
+                "Inverter actual"
+                if actual_full_hour
+                else f"Inverter + {selected_model if rain_effect else 'primary forecast'}"
+            )
+            detail_interpretation = (
+                "Measured inverter production from the workbook."
+                if actual_full_hour
+                else f"{actual_fraction * 100.0:.0f}% measured inverter energy; forecast fills the remaining time."
+            )
+            detail_level = "actual" if actual_full_hour else str(rain_level)
+            detail_effect_label = "Measured" if actual_full_hour else f"{actual_fraction * 100.0:.0f}% measured"
+        else:
+            detail_model = str(selected_model) if rain_effect else "Primary forecast"
+            detail_interpretation = (
+                str(interpretation)
+                if rain_effect
+                else "Rain effect is off; the primary solar forecast is used."
+            )
+            detail_level = str(rain_level) if rain_effect else "off"
+            detail_effect_label = ""
+        if rain_effect:
+            hourly_detail_rows.append(
+                {
+                    "date": t.date(),
+                    "hour": t.hour,
+                    "time": t.strftime("%I:%M %p").lstrip("0").lower(),
+                    "expectedKwh": round(rain_hybrid_display_kwh, 3),
+                    "conservativeKwh": round(conservative_hybrid_display_kwh, 3),
+                    "upperKwh": round(upper_hybrid_display_kwh, 3),
+                    "rainMm": round(max(0.0, _to_float(adjustment_precipitation)), 2),
+                    "rainProbability": round(min(max(_to_float(adjustment_probability), 0.0), 100.0), 1),
+                    "rainPenaltyPercent": round((1.0 - min(max(_to_float(retained_factor), 0.0), 1.0)) * 100.0, 1),
+                    "rainLevel": detail_level,
+                    "model": detail_model,
+                    "interpretation": detail_interpretation,
+                    "effectLabel": detail_effect_label,
+                }
+            )
+        else:
+            hourly_detail_rows.append(
+                {
+                    "date": t.date(),
+                    "hour": t.hour,
+                    "time": t.strftime("%I:%M %p").lstrip("0").lower(),
+                    "expectedKwh": round(base_hybrid_display_kwh, 3),
+                    "conservativeKwh": round(base_hybrid_display_kwh, 3),
+                    "upperKwh": round(base_hybrid_display_kwh, 3),
+                    "rainMm": round(max(0.0, _to_float(adjustment_precipitation)), 2),
+                    "rainProbability": round(min(max(_to_float(adjustment_probability), 0.0), 100.0), 1),
+                    "rainPenaltyPercent": 0.0,
+                    "rainLevel": detail_level,
+                    "model": detail_model,
+                    "interpretation": detail_interpretation,
+                    "effectLabel": detail_effect_label,
+                }
+            )
 
     daily_rows: List[Dict[str, object]] = []
     for day in sorted(by_day.keys())[:7]:
-        irradiation_wh_m2 = by_day[day]
-        production_kwh = daily_solar_production_kwh(system_kw, irradiation_wh_m2, efficiency_factor)
+        totals = by_day[day]
+        selected_display_kwh = (
+            totals["rain_hybrid_display_kwh"]
+            if rain_effect
+            else totals["base_hybrid_display_kwh"]
+        )
+        actual_day = inverter_daily.get(day) or {}
+        actual_complete = bool(actual_day.get("complete"))
+        if actual_complete:
+            source_type = "actual"
+        elif totals["has_inverter_actual"]:
+            source_type = "actual + forecast"
+        elif totals["has_nowcast"]:
+            source_type = "nowcast"
+        else:
+            source_type = "forecast"
         daily_rows.append(
             {
                 "date": day,
-                "irradiation_wh_m2": irradiation_wh_m2,
-                "production_kwh": production_kwh,
+                **totals,
+                "base_display_kwh": totals["base_hybrid_display_kwh"],
+                "rain_display_kwh": totals["rain_hybrid_display_kwh"],
+                "conservative_display_kwh": totals["conservative_hybrid_display_kwh"],
+                "upper_display_kwh": totals["upper_hybrid_display_kwh"],
+                "production_kwh": selected_display_kwh,
+                "remaining_today_kwh": max(
+                    selected_display_kwh - totals["estimated_by_now_kwh"],
+                    0.0,
+                ),
+                "source_type": source_type,
+                "inverter_actual_complete": actual_complete,
             }
         )
 
+    solar_history_record_forecasts(selected_site_id, daily_rows)
+    history_rows = solar_history_for_month(selected_site_id, history_month) if selected_site_id else {}
+
+    hourly_days = []
+    for day in sorted(by_day.keys())[:7]:
+        hourly_days.append(
+            {
+                "date": day.isoformat(),
+                "label": f"{day.strftime('%b%d')} {day.strftime('%a')}",
+                "rows": [
+                    row
+                    for row in hourly_detail_rows
+                    if row["date"] == day and 6 <= int(row["hour"]) <= 18
+                ],
+            }
+        )
+    for day in hourly_days:
+        for row in day["rows"]:
+            row.pop("date", None)
+            row.pop("hour", None)
+
     battery_days: List[Dict[str, object]] = []
     for day in sorted(by_day.keys())[:7]:
-        points: List[Dict[str, object]] = []
-        for t, solar in zip(hourly["time"], hourly["solar"]):
-            if t.date() != day or not (6 <= t.hour <= 18):
+        day_start = datetime.combine(day, datetime.min.time()).replace(hour=6)
+        points: List[Dict[str, object]] = [
+            {
+                "time": day_start.strftime("%I%p").lstrip("0").lower(),
+                "hour": 6,
+                "productionKwh": 0.0,
+                "isInitial": True,
+            }
+        ]
+        for t, production_kwh, _base_kwh, _rain_kwh in hourly_production:
+            if t.date() != day or not (6 <= t.hour < 18):
                 continue
-            production_kwh = daily_solar_production_kwh(system_kw, _to_float(solar), efficiency_factor)
+            interval_end = t + timedelta(hours=1)
             points.append(
                 {
-                    "time": t.strftime("%I%p").lstrip("0").lower(),
-                    "hour": t.hour,
+                    "time": interval_end.strftime("%I%p").lstrip("0").lower(),
+                    "hour": interval_end.hour,
+                    "forecastHour": t.strftime("%I:%M %p").lstrip("0").lower(),
                     "productionKwh": round(production_kwh, 3),
+                    "isInitial": False,
                 }
             )
         battery_days.append(
@@ -2042,14 +3765,24 @@ def solar_site_page():
         site_name=site_name,
         site_id=selected_site_id,
         sites=sites,
+        tz=tz,
         model=model,
         daily_rows=daily_rows,
         battery_days=battery_days,
+        hourly_days=hourly_days,
         battery_capacity_ah=battery_capacity_ah,
         max_charging_ampere=max_charging_ampere,
         initial_soc_percent=initial_soc_percent,
+        stop_discharge_soc_percent=stop_discharge_soc_percent,
         consumption_kwh_per_hour=consumption_kwh_per_hour,
         charge_first=charge_first,
+        rain_effect=rain_effect,
+        calibration_factor=calibration_factor,
+        calibration_days=calibration_days,
+        history_month=history_month,
+        history_rows=history_rows,
+        inverter_note=inverter_note,
+        today=today,
     )
     return Response(html, mimetype="text/html")
 
@@ -2179,6 +3912,10 @@ button.danger:hover { background: #c82333; }
            <input v-model.number="site.initial_soc_percent" type="number" step="1" min="0" max="100" />
          </div>
          <div class="site-field">
+           <label>Stop Discharge SOC %</label>
+           <input v-model.number="site.stop_discharge_soc_percent" type="number" step="1" min="0" max="100" />
+         </div>
+         <div class="site-field">
            <label>Consumption kWh / Hour</label>
            <input v-model.number="site.consumption_kwh_per_hour" type="number" step="0.1" min="0" />
          </div>
@@ -2239,6 +3976,7 @@ createApp({
             }
             if (site.max_charging_ampere === undefined) site.max_charging_ampere = 100;
             if (site.initial_soc_percent === undefined) site.initial_soc_percent = 20;
+            if (site.stop_discharge_soc_percent === undefined) site.stop_discharge_soc_percent = 20;
             if (site.consumption_kwh_per_hour === undefined) site.consumption_kwh_per_hour = 0;
             if (site.charge_first === undefined) site.charge_first = false;
           });
@@ -2300,6 +4038,7 @@ createApp({
         total_battery_capacity_ah: 100,
         max_charging_ampere: 100,
         initial_soc_percent: 20,
+        stop_discharge_soc_percent: 20,
         consumption_kwh_per_hour: 0,
         charge_first: false,
         lat: 13.174,

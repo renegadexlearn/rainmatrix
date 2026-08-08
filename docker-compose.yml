@@ -11,6 +11,7 @@ services:
 
       # Ensure places.json is editable without rebuild (recommended)
       - ./places.json:/app/places.json
+      - ./data.xlsx:/app/data.xlsx:ro
     ports:
       # local-only bind; Nginx will proxy to this
       - "127.0.0.1:8005:8000"

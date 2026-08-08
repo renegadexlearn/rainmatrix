@@ -14,9 +14,11 @@ COPY run.py /app/run.py
 # If you commit places.json in git, keep this line.
 # If you prefer to keep it outside git, we'll mount it via docker-compose.
 COPY places.json /app/places.json
+COPY data.xlsx /app/data.xlsx
+COPY requirements.txt /app/requirements.txt
 
 RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir flask requests gunicorn
+ && pip install --no-cache-dir -r requirements.txt gunicorn
 
 # Gunicorn listens on container port 8000
 EXPOSE 8000
